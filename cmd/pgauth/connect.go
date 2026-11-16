@@ -15,7 +15,7 @@ import (
 	"syscall"
 	"text/tabwriter"
 
-	"github.com/RapidataAI/pgauth/internal/connect"
+	"github.com/LucStr/pgauth/internal/connect"
 )
 
 const defaultCallbackPort = 8250

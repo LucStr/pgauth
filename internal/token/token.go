@@ -14,7 +14,7 @@ import (
 
 	"github.com/coreos/go-oidc/v3/oidc"
 
-	"github.com/RapidataAI/pgauth/internal/config"
+	"github.com/LucStr/pgauth/internal/config"
 )
 
 type Claims struct {

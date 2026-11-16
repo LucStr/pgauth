@@ -1,4 +1,4 @@
-module github.com/RapidataAI/pgauth
+module github.com/LucStr/pgauth
 
 go 1.27.3
 

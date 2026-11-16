@@ -20,7 +20,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
-const scope = "github.com/RapidataAI/pgauth"
+const scope = "github.com/LucStr/pgauth"
 
 // Setup exports spans, metrics and logs only when an OTLP endpoint is set; OTEL_LOGS_EXPORTER=none
 // and friends switch one signal off. The returned provider is nil when nothing is exported.

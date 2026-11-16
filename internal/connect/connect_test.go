@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RapidataAI/pgauth/internal/api"
+	"github.com/LucStr/pgauth/internal/api"
 )
 
 func TestTargetDatabase(t *testing.T) {

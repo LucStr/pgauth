@@ -9,9 +9,9 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/RapidataAI/pgauth/internal/config"
-	"github.com/RapidataAI/pgauth/internal/rbac"
-	"github.com/RapidataAI/pgauth/internal/token"
+	"github.com/LucStr/pgauth/internal/config"
+	"github.com/LucStr/pgauth/internal/rbac"
+	"github.com/LucStr/pgauth/internal/token"
 )
 
 // Discovery is the body of GET /.well-known/pgauth.

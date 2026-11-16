@@ -6,7 +6,7 @@ import (
 
 	"sigs.k8s.io/yaml"
 
-	"github.com/RapidataAI/pgauth/internal/connect"
+	"github.com/LucStr/pgauth/internal/connect"
 )
 
 func TestListeners(t *testing.T) {
