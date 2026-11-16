@@ -20,12 +20,12 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 
-	"github.com/RapidataAI/pgauth/internal/api"
-	"github.com/RapidataAI/pgauth/internal/config"
-	"github.com/RapidataAI/pgauth/internal/proxy"
-	"github.com/RapidataAI/pgauth/internal/rbac"
-	"github.com/RapidataAI/pgauth/internal/telemetry"
-	"github.com/RapidataAI/pgauth/internal/token"
+	"github.com/LucStr/pgauth/internal/api"
+	"github.com/LucStr/pgauth/internal/config"
+	"github.com/LucStr/pgauth/internal/proxy"
+	"github.com/LucStr/pgauth/internal/rbac"
+	"github.com/LucStr/pgauth/internal/telemetry"
+	"github.com/LucStr/pgauth/internal/token"
 )
 
 var version = "dev"
@@ -136,7 +136,7 @@ func serve(args []string) error {
 // rbacStore records every load of the access rules as metrics: a counter by result and a gauge
 // that is 1 while the last change was rejected.
 func rbacStore(cfg *config.Config, log *slog.Logger) (*rbac.Store, error) {
-	meter := otel.Meter("github.com/RapidataAI/pgauth")
+	meter := otel.Meter("github.com/LucStr/pgauth")
 	loads, err := meter.Int64Counter("pgauth.rbac.loads", metric.WithDescription("Access-rule loads by result"))
 	if err != nil {
 		return nil, err

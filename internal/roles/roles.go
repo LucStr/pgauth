@@ -121,7 +121,7 @@ func NewManager(pool *pgxpool.Pool, opts Options) *Manager {
 	if opts.MaxConnectionAge <= 0 {
 		opts.MaxConnectionAge = 12 * time.Hour
 	}
-	failed, _ := otel.Meter("github.com/RapidataAI/pgauth").Int64Counter("pgauth.roles.drop_failed",
+	failed, _ := otel.Meter("github.com/LucStr/pgauth").Int64Counter("pgauth.roles.drop_failed",
 		metric.WithDescription("Temporary roles that could not be dropped and were left NOLOGIN without rights"))
 	return &Manager{pool: pool, opts: opts, current: map[string]*entry{}, byName: map[string]*entry{}, dropFailed: failed}
 }

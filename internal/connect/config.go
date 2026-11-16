@@ -16,7 +16,7 @@ import (
 
 	"sigs.k8s.io/yaml"
 
-	"github.com/RapidataAI/pgauth/internal/api"
+	"github.com/LucStr/pgauth/internal/api"
 )
 
 // File is connect.yaml.

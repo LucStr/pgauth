@@ -18,7 +18,7 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/RapidataAI/pgauth/internal/api"
+	"github.com/LucStr/pgauth/internal/api"
 )
 
 // Env is one pgauth deployment the connector reaches: its Postgres port, its HTTPS API and where

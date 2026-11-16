@@ -39,13 +39,13 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/RapidataAI/pgauth/internal/api"
-	"github.com/RapidataAI/pgauth/internal/config"
-	pgconnect "github.com/RapidataAI/pgauth/internal/connect"
-	"github.com/RapidataAI/pgauth/internal/rbac"
-	"github.com/RapidataAI/pgauth/internal/roles"
-	"github.com/RapidataAI/pgauth/internal/telemetry"
-	"github.com/RapidataAI/pgauth/internal/token"
+	"github.com/LucStr/pgauth/internal/api"
+	"github.com/LucStr/pgauth/internal/config"
+	pgconnect "github.com/LucStr/pgauth/internal/connect"
+	"github.com/LucStr/pgauth/internal/rbac"
+	"github.com/LucStr/pgauth/internal/roles"
+	"github.com/LucStr/pgauth/internal/telemetry"
+	"github.com/LucStr/pgauth/internal/token"
 )
 
 const (

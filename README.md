@@ -165,7 +165,7 @@ pgauth serve --config /etc/pgauth/config.yaml
 See [`config.example.yaml`](config.example.yaml) for every setting. Upstream `sslmode` takes the libpq
 values; `require` encrypts without verifying the server certificate, `verify-ca` / `verify-full` with
 `sslrootcert` also verify it. The image
-`ghcr.io/rapidataai/pgauth:vX.Y.Z` runs as non-root and needs no writable filesystem.
+`ghcr.io/lucstr/pgauth:vX.Y.Z` runs as non-root and needs no writable filesystem.
 
 - **Health:** `GET /healthz` answers while the process runs; `GET /readyz` answers 200 once the
   issuer's keys and a valid set of access rules are loaded and every instance accepts the issuer login
@@ -265,7 +265,7 @@ pgauth does not serve fail with `serves no database`; limit the data source's **
 databases you use to keep the IDE quiet.
 
 Binaries for macOS (arm64, amd64) and Linux (amd64, arm64) are attached to each
-[GitHub release](https://github.com/RapidataAI/pgauth/releases). A binary downloaded with a browser
+[GitHub release](https://github.com/LucStr/pgauth/releases). A binary downloaded with a browser
 on macOS is quarantined; download it with `curl` or run `xattr -d com.apple.quarantine pgauth`.
 
 ## Development

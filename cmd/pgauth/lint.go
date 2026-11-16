@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/RapidataAI/pgauth/internal/config"
-	"github.com/RapidataAI/pgauth/internal/rbac"
+	"github.com/LucStr/pgauth/internal/config"
+	"github.com/LucStr/pgauth/internal/rbac"
 )
 
 // lint checks access rules offline: it reads only the config file and the YAML, never the files

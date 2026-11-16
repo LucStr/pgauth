@@ -26,10 +26,10 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/RapidataAI/pgauth/internal/config"
-	"github.com/RapidataAI/pgauth/internal/rbac"
-	"github.com/RapidataAI/pgauth/internal/roles"
-	"github.com/RapidataAI/pgauth/internal/token"
+	"github.com/LucStr/pgauth/internal/config"
+	"github.com/LucStr/pgauth/internal/rbac"
+	"github.com/LucStr/pgauth/internal/roles"
+	"github.com/LucStr/pgauth/internal/token"
 )
 
 const handshakeTimeout = 30 * time.Second
@@ -70,7 +70,7 @@ func New(cfg *config.Config, verifier *token.Verifier, store *rbac.Store, tlsCon
 		rbac:      store,
 		tls:       tlsConfig,
 		log:       log,
-		tracer:    otel.Tracer("github.com/RapidataAI/pgauth"),
+		tracer:    otel.Tracer("github.com/LucStr/pgauth"),
 		instances: map[string]*instance{},
 		stopping:  make(chan struct{}),
 		userConns: map[string]int{},
