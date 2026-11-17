@@ -96,6 +96,8 @@ const (
 	// failuresToUnready failed checks in a row make a ready instance not ready.
 	failuresToUnready = 3
 	maxRetryWait      = 5 * time.Second
+	// checkTimeout bounds one self-test, so a blocked CREATE ROLE counts as a failure.
+	checkTimeout = 30 * time.Second
 )
 
 // watch checks in until ctx ends: not ready until the first pass, then not ready only after
@@ -106,17 +108,19 @@ func (s *Server) watch(ctx context.Context, in *instance) {
 	for wait := time.Second; ; {
 		var step string
 		var err error
+		check, cancel := context.WithTimeout(ctx, checkTimeout)
 		if in.roles == nil {
 			step, swept, err = s.startInstance(ctx, in)
-		} else if err = in.pool.Ping(ctx); err != nil {
+		} else if err = in.pool.Ping(check); err != nil {
 			step = "issuer login"
 		}
 		if err == nil {
-			step, err = "self-test", in.selfTest(ctx)
+			step, err = "self-test", in.selfTest(check)
 			if se := (*roles.StepError)(nil); errors.As(err, &se) {
 				step, err = "self-test: "+se.Step, se.Err
 			}
 		}
+		cancel()
 		if ctx.Err() != nil {
 			return
 		}

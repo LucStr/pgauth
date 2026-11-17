@@ -371,7 +371,10 @@ func (m *Manager) SelfTest(ctx context.Context, groups []string, login func(role
 	} else if err = login(e.name, e.password); err != nil {
 		err = &StepError{Step: "first login of temporary role", Err: err}
 	}
-	if derr := m.removeRole(context.WithoutCancel(ctx), e.name); derr != nil && err == nil {
+	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	derr := m.removeRole(dctx, e.name)
+	cancel()
+	if derr != nil && err == nil {
 		err = &StepError{Step: "drop temporary role", Err: derr}
 	}
 	m.mu.Lock()

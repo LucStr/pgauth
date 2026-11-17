@@ -278,7 +278,7 @@ type auditLog struct {
 	mu     sync.Mutex
 	lines  []map[string]any
 	otel   []map[string]any
-	status []map[string]any // "instance ready" and "instance not ready"
+	status []map[string]any
 }
 
 func (l *auditLog) Export(_ context.Context, records []sdklog.Record) error {
@@ -1379,9 +1379,21 @@ func selfTestRoles(t *testing.T) int {
 // created, log in to every served database and be dropped; the log names the failed step.
 func TestSelfTest(t *testing.T) {
 	ctx := context.Background()
-	stmts := append(setupDatabaseSQL("noconnect"), `REVOKE CONNECT ON DATABASE noconnect FROM PUBLIC`)
-	if err := execAll(ctx, shared.adminDSN, stmts); err != nil {
+	var exists bool
+	conn, err := pgx.Connect(ctx, shared.adminDSN)
+	if err != nil {
 		t.Fatal(err)
+	}
+	err = conn.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'noconnect')`).Scan(&exists)
+	conn.Close(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists {
+		stmts := append(setupDatabaseSQL("noconnect"), `REVOKE CONNECT ON DATABASE noconnect FROM PUBLIC`)
+		if err := execAll(ctx, shared.adminDSN, stmts); err != nil {
+			t.Fatal(err)
+		}
 	}
 	for _, tt := range []struct {
 		name      string
@@ -1412,9 +1424,7 @@ func TestSelfTest(t *testing.T) {
 					t.Fatalf("connect while not ready: %v", err)
 				}
 			}
-			if n := selfTestRoles(t); n != 0 {
-				t.Fatalf("%d self-test roles left", n)
-			}
+			waitFor(t, "no self-test role left", func() bool { return selfTestRoles(t) == 0 })
 		})
 	}
 }
