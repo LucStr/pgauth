@@ -120,6 +120,7 @@ GRANT pgauth_temp TO pgauth WITH ADMIN TRUE, INHERIT FALSE, SET FALSE;
 CREATE ROLE <db>_read NOLOGIN;
 CREATE ROLE <db>_write NOLOGIN;
 GRANT <db>_read, <db>_write TO pgauth WITH ADMIN TRUE, INHERIT FALSE, SET FALSE;
+-- both roles, even for a database nobody writes: the self-test joins every one
 
 -- per database <db>, connected to <db>
 GRANT USAGE ON SCHEMA public TO <db>_read, <db>_write;
@@ -168,8 +169,17 @@ values; `require` encrypts without verifying the server certificate, `verify-ca`
 `ghcr.io/lucstr/pgauth:vX.Y.Z` runs as non-root and needs no writable filesystem.
 
 - **Health:** `GET /healthz` answers while the process runs; `GET /readyz` answers 200 once the
-  issuer's keys and a valid set of access rules are loaded and every instance accepts the issuer login
-  (and its startup sweep ran); its body reports a rejected rules change.
+  issuer's keys and a valid set of access rules are loaded and every instance passed a self-test
+  ([ADR 0013](docs/adr/0013-ready-only-after-a-self-test.md)); its body reports a rejected rules change.
+  The self-test creates `<rolePrefix>_selftest_<pod><random>` joined to every group role of the
+  instance (each database's read and write role, and `statsRole`), logs in as it to every served
+  database and drops it, at startup and every `selfTestInterval` (10m). A ready instance turns not
+  ready only after 3 failed checks in a row, a second apart; one pass makes it ready again. Each change
+  logs once: `instance ready` with `roles`, or `instance not ready` with `failures`, the failed `step`
+  (`issuer login`, `owner lock`, `sweep`, `self-test: create temporary role`, `self-test: first login
+  of temporary role`, `self-test: drop temporary role`) and Postgres's `error`. Metrics per
+  `pgauth.instance`: `pgauth.selftest.ok` (1 or 0), `pgauth.selftest.time` (Unix seconds) and
+  `pgauth.selftest.runs` by `result`.
 - **HTTPS API** (`http.listen`, same certificate as Postgres; [ADR 0011](docs/adr/0011-serve-publishes-discovery-and-access.md)):
   - `GET /.well-known/pgauth` → `{postgres, issuer, audience, cli_client_id, scopes: {read, write},
     instances: [{name, databases}]}`, public, so a connector can set itself up from a host name.

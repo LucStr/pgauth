@@ -39,6 +39,7 @@ maxConnectionAge: 12h      # default
 roleConnectionLimit: 20    # default: CONNECTION LIMIT of a temporary role, and connections sharing one
 maxConnectionsPerUser: 50  # default: open connections per subject through this pgauth
 sweepInterval: 1m          # default: how often leftover roles are removed
+selfTestInterval: 10m      # default: how often each instance proves a temporary role with every group role can log in; gates /readyz
 
 instances:
   - name: main

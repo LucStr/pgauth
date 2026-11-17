@@ -26,6 +26,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 )
 
@@ -79,6 +80,8 @@ type Options struct {
 	// unused after 1.5 × MaxConnectionAge.
 	MaxConnectionAge time.Duration
 	Log              *slog.Logger
+	// Instance names the instance in the self-test metrics.
+	Instance string
 }
 
 // validFor is how long after the token's exp a role's password still opens new logins.
@@ -101,7 +104,10 @@ type Manager struct {
 	current map[string]*entry // spec key → the role new connections get
 	byName  map[string]*entry // every role this process created and has not removed
 
-	dropFailed metric.Int64Counter
+	dropFailed               metric.Int64Counter
+	selfTestRuns             metric.Int64Counter
+	selfTestOK, selfTestTime metric.Int64Gauge
+	instance                 metric.MeasurementOption
 }
 
 type entry struct {
@@ -121,9 +127,16 @@ func NewManager(pool *pgxpool.Pool, opts Options) *Manager {
 	if opts.MaxConnectionAge <= 0 {
 		opts.MaxConnectionAge = 12 * time.Hour
 	}
-	failed, _ := otel.Meter("github.com/LucStr/pgauth").Int64Counter("pgauth.roles.drop_failed",
+	meter := otel.Meter("github.com/LucStr/pgauth")
+	failed, _ := meter.Int64Counter("pgauth.roles.drop_failed",
 		metric.WithDescription("Temporary roles that could not be dropped and were left NOLOGIN without rights"))
-	return &Manager{pool: pool, opts: opts, current: map[string]*entry{}, byName: map[string]*entry{}, dropFailed: failed}
+	runs, _ := meter.Int64Counter("pgauth.selftest.runs", metric.WithDescription("Temporary-role self-tests by result, pass or fail"))
+	ok, _ := meter.Int64Gauge("pgauth.selftest.ok", metric.WithDescription("1 when the last temporary-role self-test passed, else 0"))
+	at, _ := meter.Int64Gauge("pgauth.selftest.time", metric.WithDescription("When the last temporary-role self-test finished"), metric.WithUnit("s"))
+	return &Manager{
+		pool: pool, opts: opts, current: map[string]*entry{}, byName: map[string]*entry{}, dropFailed: failed,
+		selfTestRuns: runs, selfTestOK: ok, selfTestTime: at, instance: metric.WithAttributes(attribute.String("pgauth.instance", opts.Instance)),
+	}
 }
 
 // Start takes this process's owner lock under a fresh nonce; it must succeed before Acquire.
@@ -146,6 +159,11 @@ func (m *Manager) Start(ctx context.Context) error {
 		conn.Release()
 	}
 	return errors.New("could not take an owner lock")
+}
+
+// Stop releases the owner lock taken by Start; only before Run, which owns it after.
+func (m *Manager) Stop() {
+	m.ownerConn.Release()
 }
 
 // Nonce identifies this process in the names and comments of its roles.
@@ -279,9 +297,16 @@ func (m *Manager) refresh(ctx context.Context, e *entry, validUntil time.Time) e
 // no sessions, then DROP ROLE. A role that still cannot be dropped stays NOLOGIN without rights,
 // and is retried by the next sweep.
 func (m *Manager) remove(ctx context.Context, role string) error {
+	if err := m.removeRole(ctx, role); err != nil {
+		return m.removeFailed(role, err)
+	}
+	return nil
+}
+
+func (m *Manager) removeRole(ctx context.Context, role string) error {
 	conn, err := m.pool.Acquire(ctx)
 	if err != nil {
-		return m.removeFailed(role, err)
+		return err
 	}
 	defer conn.Release()
 	ident := pgx.Identifier{role}.Sanitize()
@@ -289,7 +314,7 @@ func (m *Manager) remove(ctx context.Context, role string) error {
 		if strings.Contains(err.Error(), "does not exist") {
 			return nil
 		}
-		return m.removeFailed(role, err)
+		return err
 	}
 	rows, err := conn.Query(ctx, `
 		SELECT g.rolname FROM pg_auth_members am
@@ -297,22 +322,22 @@ func (m *Manager) remove(ctx context.Context, role string) error {
 		JOIN pg_roles r ON r.oid = am.member
 		WHERE r.rolname = $1 AND g.rolname <> $2`, role, m.opts.TempGroup)
 	if err != nil {
-		return m.removeFailed(role, err)
+		return err
 	}
 	groups, err := pgx.CollectRows(rows, pgx.RowTo[string])
 	if err != nil {
-		return m.removeFailed(role, err)
+		return err
 	}
 	for _, g := range groups {
 		if _, err := conn.Exec(ctx, "REVOKE "+pgx.Identifier{g}.Sanitize()+" FROM "+ident); err != nil {
-			return m.removeFailed(role, err)
+			return err
 		}
 	}
 	if _, err := conn.Exec(ctx, "SELECT pg_terminate_backend(pid, 2000) FROM pg_stat_activity WHERE usename = $1", role); err != nil {
-		return m.removeFailed(role, err)
+		return err
 	}
 	if _, err := conn.Exec(ctx, "DROP ROLE IF EXISTS "+ident); err != nil {
-		return m.removeFailed(role, err)
+		return err
 	}
 	return nil
 }
@@ -320,6 +345,45 @@ func (m *Manager) remove(ctx context.Context, role string) error {
 func (m *Manager) removeFailed(role string, err error) error {
 	m.dropFailed.Add(context.Background(), 1)
 	m.opts.Log.Error("temporary role not dropped; left without login or rights where possible", "role", role, "error", err)
+	return err
+}
+
+// StepError is the failed step of a self-test.
+type StepError struct {
+	Step string
+	Err  error
+}
+
+func (e *StepError) Error() string { return e.Step + ": " + e.Err.Error() }
+func (e *StepError) Unwrap() error { return e.Err }
+
+// SelfTest creates a temporary role the way Acquire does, joined to groups, calls login with it and
+// removes it. The role is never handed out; one left by a crash is swept once this process is gone.
+func (m *Manager) SelfTest(ctx context.Context, groups []string, login func(role, password string) error) error {
+	e := &entry{name: m.opts.Prefix + "_selftest_" + m.nonce + randomName(6), created: time.Now(), password: randomName(32)}
+	m.mu.Lock()
+	m.byName[e.name] = e
+	m.mu.Unlock()
+	spec := Spec{Subject: "pgauth self-test", ClientID: "pgauth", Groups: groups}
+	err := m.create(ctx, e, spec, e.created.Add(validFor))
+	if err != nil {
+		err = &StepError{Step: "create temporary role", Err: err}
+	} else if err = login(e.name, e.password); err != nil {
+		err = &StepError{Step: "first login of temporary role", Err: err}
+	}
+	if derr := m.removeRole(context.WithoutCancel(ctx), e.name); derr != nil && err == nil {
+		err = &StepError{Step: "drop temporary role", Err: derr}
+	}
+	m.mu.Lock()
+	delete(m.byName, e.name)
+	m.mu.Unlock()
+	ok, result := int64(0), "fail"
+	if err == nil {
+		ok, result = 1, "pass"
+	}
+	m.selfTestRuns.Add(ctx, 1, m.instance, metric.WithAttributes(attribute.String("result", result)))
+	m.selfTestOK.Record(ctx, ok, m.instance)
+	m.selfTestTime.Record(ctx, time.Now().Unix(), m.instance)
 	return err
 }
 

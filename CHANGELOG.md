@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.7.0
+
+- **Readiness proves the temporary-role path** ([ADR 0013](docs/adr/0013-ready-only-after-a-self-test.md)). An instance is ready only after a self-test: create a temporary role joined to every group role (each database's read and write role, plus `statsRole`), log in as it to every served database, drop it. It repeats every `selfTestInterval` (10m); a ready instance turns not ready only after 3 failed checks in a row and is ready again after one pass, logging each change once with the failed `step` and Postgres's `error`. Metrics `pgauth.selftest.ok`, `pgauth.selftest.time` and `pgauth.selftest.runs`. Before, readiness was a ping, so a failing `CREATE ROLE` stayed green until someone connected.
+- Startup retries back off to 5 s instead of 30 s, and a failed first sweep no longer hangs the instance's start.
+
+Upgrading from v0.6.x: every served database needs both its read and its write group role, held by the issuer with `ADMIN`, and the temporary roles need `CONNECT` on it; otherwise the instance never becomes ready and the log names the missing role or database.
+
 ## v0.6.0
 
 Security release from an audit of v0.5.1–v0.5.2. Upgrading drops the previous version's temporary roles on the first sweep, ending their sessions.

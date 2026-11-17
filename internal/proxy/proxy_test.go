@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -189,6 +190,22 @@ spec:
 // startServer also serves the HTTPS API (discovery, access) and returns its base URL.
 func startServer(t *testing.T, mutate func(*config.Config)) (string, *rbac.Store, *auditLog, *httptest.Server) {
 	t.Helper()
+	ts := newServer(t, mutate, nil)
+	return ts.addr, ts.store, ts.audit, ts.api
+}
+
+type testServer struct {
+	srv   *Server
+	addr  string
+	store *rbac.Store
+	audit *auditLog
+	api   *httptest.Server
+}
+
+// newServer starts a pgauth like startServer; with before set it calls before ahead of Start and
+// does not wait for readiness.
+func newServer(t *testing.T, mutate func(*config.Config), before func(*Server)) *testServer {
+	t.Helper()
 	cfg := &config.Config{
 		TLS: config.TLS{CertFile: shared.certFile, KeyFile: shared.keyFile},
 		OIDC: config.OIDC{
@@ -223,9 +240,12 @@ func startServer(t *testing.T, mutate func(*config.Config)) (string, *rbac.Store
 		t.Fatal(err)
 	}
 	srv := New(cfg, verifier, store, &tls.Config{Certificates: []tls.Certificate{cert}}, log)
+	if before != nil {
+		before(srv)
+	}
 	srv.Start(ctx)
 	deadline := time.Now().Add(10 * time.Second)
-	for srv.Ready(ctx) != nil {
+	for before == nil && srv.Ready(ctx) != nil {
 		if time.Now().After(deadline) {
 			t.Fatalf("not ready: %v", srv.Ready(ctx))
 		}
@@ -248,16 +268,17 @@ func startServer(t *testing.T, mutate func(*config.Config)) (string, *rbac.Store
 	apiSrv.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
 	apiSrv.StartTLS()
 	t.Cleanup(apiSrv.Close)
-	return ln.Addr().String(), store, audit, apiSrv
+	return &testServer{srv: srv, addr: ln.Addr().String(), store: store, audit: audit, api: apiSrv}
 }
 
 // auditLog keeps the server's JSON log lines so tests can read the connect record.
 // auditLog keeps the connect records twice: as stdout JSON lines and as OpenTelemetry log records,
 // the two outputs of telemetry.Logger.
 type auditLog struct {
-	mu    sync.Mutex
-	lines []map[string]any
-	otel  []map[string]any
+	mu     sync.Mutex
+	lines  []map[string]any
+	otel   []map[string]any
+	status []map[string]any // "instance ready" and "instance not ready"
 }
 
 func (l *auditLog) Export(_ context.Context, records []sdklog.Record) error {
@@ -293,12 +314,30 @@ func (l *auditLog) ForceFlush(context.Context) error { return nil }
 
 func (l *auditLog) Write(p []byte) (int, error) {
 	var line map[string]any
-	if json.Unmarshal(p, &line) == nil && line["msg"] == "connect" {
-		l.mu.Lock()
+	if json.Unmarshal(p, &line) != nil {
+		return len(p), nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	switch line["msg"] {
+	case "connect":
 		l.lines = append(l.lines, line)
-		l.mu.Unlock()
+	case "instance ready", "instance not ready":
+		l.status = append(l.status, line)
 	}
 	return len(p), nil
+}
+
+func (l *auditLog) all(msg string) []map[string]any {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []map[string]any
+	for _, line := range l.status {
+		if line["msg"] == msg {
+			out = append(out, line)
+		}
+	}
+	return out
 }
 
 func (l *auditLog) count() int {
@@ -1311,4 +1350,119 @@ func writeCert(dir string) (certFile, keyFile string, err error) {
 		return "", "", err
 	}
 	return certFile, keyFile, os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}), 0o600)
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); !cond(); time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+	}
+}
+
+func selfTestRoles(t *testing.T) int {
+	t.Helper()
+	conn, err := pgx.Connect(context.Background(), shared.adminDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	var n int
+	if err := conn.QueryRow(context.Background(), `SELECT count(*) FROM pg_roles WHERE starts_with(rolname, 'pgauth__selftest_')`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// TestSelfTest: an instance is ready only while a temporary role joined to every group role can be
+// created, log in to every served database and be dropped; the log names the failed step.
+func TestSelfTest(t *testing.T) {
+	ctx := context.Background()
+	stmts := append(setupDatabaseSQL("noconnect"), `REVOKE CONNECT ON DATABASE noconnect FROM PUBLIC`)
+	if err := execAll(ctx, shared.adminDSN, stmts); err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range []struct {
+		name      string
+		mutate    func(*config.Config)
+		step, err string // empty: ready
+	}{
+		{"every role grantable: ready", func(c *config.Config) { c.Instances[0].StatsRole = "pgauth_stats" }, "", ""},
+		{"a write role missing upstream", func(c *config.Config) { c.GroupRoles.Write = "{db}_missing" },
+			"self-test: create temporary role", `role "assignment_missing" does not exist`},
+		{"no CONNECT on a served database", func(c *config.Config) { c.Instances[0].Databases = append(c.Instances[0].Databases, "noconnect") },
+			"self-test: first login of temporary role", "noconnect: "},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ts := newServer(t, tt.mutate, func(*Server) {})
+			if tt.step == "" {
+				waitFor(t, "ready", func() bool { return ts.srv.Ready(ctx) == nil })
+				line := ts.audit.all("instance ready")[0]
+				if got := fmt.Sprint(line["roles"]); got != "[assignment_read assignment_write order_read order_write pgauth_stats]" {
+					t.Errorf("ready roles = %s", got)
+				}
+			} else {
+				waitFor(t, "instance not ready", func() bool { return len(ts.audit.all("instance not ready")) > 0 })
+				line := ts.audit.all("instance not ready")[0]
+				if line["step"] != tt.step || !strings.Contains(fmt.Sprint(line["error"]), tt.err) {
+					t.Fatalf("not ready step = %v, error = %v; want %s, %s", line["step"], line["error"], tt.step, tt.err)
+				}
+				if _, err := connect(ctx, ts.addr, "cloudsql-main/order", claims{}); err == nil || !strings.Contains(err.Error(), "not ready") {
+					t.Fatalf("connect while not ready: %v", err)
+				}
+			}
+			if n := selfTestRoles(t); n != 0 {
+				t.Fatalf("%d self-test roles left", n)
+			}
+		})
+	}
+}
+
+// TestSelfTestFailuresInARow: a ready instance stays ready through two failed checks in a row, turns
+// not ready at the third without touching open connections, and is ready again after one pass.
+func TestSelfTestFailuresInARow(t *testing.T) {
+	ctx := context.Background()
+	var failNext atomic.Int32
+	ts := newServer(t, func(c *config.Config) { c.SelfTestInterval = config.Duration(300 * time.Millisecond) }, func(s *Server) {
+		in := s.instances[instanceName]
+		selfTest := in.selfTest
+		in.selfTest = func(ctx context.Context) error {
+			if failNext.Add(-1) >= 0 {
+				return &roles.StepError{Step: "first login of temporary role", Err: errors.New("injected")}
+			}
+			failNext.Store(0)
+			return selfTest(ctx)
+		}
+	})
+	waitFor(t, "ready", func() bool { return ts.srv.Ready(ctx) == nil })
+	open, err := connect(ctx, ts.addr, "cloudsql-main/order", claims{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer open.Close(ctx)
+
+	failNext.Store(2)
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		if err := ts.srv.Ready(ctx); err != nil {
+			t.Fatalf("two failed checks made the instance not ready: %v", err)
+		}
+	}
+	failNext.Store(1000)
+	waitFor(t, "not ready after three failures", func() bool { return ts.srv.Ready(ctx) != nil })
+	if _, err := connect(ctx, ts.addr, "cloudsql-main/order", claims{}); err == nil {
+		t.Error("new connection while not ready")
+	}
+	if err := open.Ping(ctx); err != nil {
+		t.Errorf("open connection while not ready: %v", err)
+	}
+	failNext.Store(0)
+	waitFor(t, "ready after one pass", func() bool { return ts.srv.Ready(ctx) == nil })
+	down := ts.audit.all("instance not ready")
+	if len(down) != 1 || down[0]["failures"] != float64(3) || down[0]["step"] != "self-test: first login of temporary role" {
+		t.Fatalf("not ready lines = %v, want one with 3 failures", down)
+	}
+	if n := len(ts.audit.all("instance ready")); n != 2 {
+		t.Fatalf("%d ready lines, want 2", n)
+	}
 }

@@ -36,6 +36,9 @@ type Config struct {
 	// SweepMinAge is ignored since v0.6.0; roles belong to the process that made them.
 	SweepMinAge   Duration `json:"sweepMinAge"`
 	SweepInterval Duration `json:"sweepInterval"`
+	// SelfTestInterval is how often each instance proves a temporary role can be created, joined to
+	// every group role, logged in as and dropped; readiness follows it.
+	SelfTestInterval Duration `json:"selfTestInterval"`
 	// RoleConnectionLimit is each temporary role's CONNECTION LIMIT and how many connections share one.
 	RoleConnectionLimit int `json:"roleConnectionLimit"`
 	// MaxConnectionsPerUser caps one subject's open connections through this pgauth.
@@ -187,6 +190,9 @@ func (c *Config) ApplyDefaults() {
 	if c.SweepInterval == 0 {
 		c.SweepInterval = Duration(time.Minute)
 	}
+	if c.SelfTestInterval == 0 {
+		c.SelfTestInterval = Duration(10 * time.Minute)
+	}
 	if c.RoleConnectionLimit == 0 {
 		c.RoleConnectionLimit = 20
 	}
@@ -219,6 +225,9 @@ func (c *Config) Validate() error {
 	req(c.OIDC.Issuer, "oidc.issuer")
 	req(c.OIDC.Audience, "oidc.audience")
 	req(c.RBAC.Dir, "rbac.dir")
+	if c.SelfTestInterval < 0 {
+		errs = append(errs, errors.New("selfTestInterval must be positive"))
+	}
 	if len(c.Instances) == 0 {
 		errs = append(errs, errors.New("instances needs at least one entry"))
 	}
@@ -235,6 +244,20 @@ func (c *Config) Validate() error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// SelfTestRoles are every group role a temporary role on in can join: each database's read and write
+// role and the stats role.
+func (c *Config) SelfTestRoles(in Instance) []string {
+	var r []string
+	for _, db := range in.Databases {
+		r = append(r, c.GroupRole("read", db), c.GroupRole("write", db))
+	}
+	if in.StatsRole != "" {
+		r = append(r, in.StatsRole)
+	}
+	slices.Sort(r)
+	return slices.Compact(r)
 }
 
 func (c *Config) Instance(name string) (Instance, bool) {
