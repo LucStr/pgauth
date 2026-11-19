@@ -249,6 +249,11 @@ process no longer uses, whose owner's lock is gone, or that are older than 1.5 Ã
 plus 10 minutes. Several replicas are safe; a crashed replica's roles are removed by the next sweep
 of any other.
 
+Table groups (`pgauth_t_*`, [ADR 0013](docs/adr/0013-authorization-details-narrow-to-tables.md)) are
+permanent: they are not members of `pgauth_temp`, so the sweep never touches them, and nothing drops
+them. A temporary role only joins them, and on every connect pgauth re-checks that the binding's group
+still holds the verb and that the table group holds what it needs before the temporary role joins it.
+
 Limits before and around authentication:
 
 - Messages before a token is accepted are capped at 64 KiB, and the handshake has 30 seconds.
