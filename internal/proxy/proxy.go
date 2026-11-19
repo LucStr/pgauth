@@ -481,6 +481,8 @@ func (s *Server) Tables(ctx context.Context, instance, db string) ([]api.Table, 
 	if !ok || !in.cfg.Serves(db) {
 		return nil, fmt.Errorf("database %s/%s is not served", instance, db)
 	}
+	ctx, cancel := context.WithTimeout(ctx, issuerTimeout)
+	defer cancel()
 	conn, err := s.issuerConn(ctx, in.cfg, db)
 	if err != nil {
 		return nil, err

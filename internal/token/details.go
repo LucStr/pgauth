@@ -29,21 +29,23 @@ var (
 	verbs   = []string{"select", "insert", "update", "delete"}
 )
 
-// ParseDetails reads the authorization_details claim and keeps the rows of type typ. Any field it
-// does not know, or a row of typ that is malformed or names another location than audience, fails.
-func ParseDetails(raw any, typ, audience string) ([]Detail, error) {
-	b, err := json.Marshal(raw)
-	if err != nil {
+var (
+	rowKeys  = []string{"type", "locations", "identifier", "actions", "tables"}
+	ruleKeys = []string{"name", "verbs"}
+)
+
+// ParseDetails reads the authorization_details claim and keeps the rows of type typ. Any key that is
+// not an exact, single field (encoding/json would fold case and let duplicates win), any row of typ
+// that is malformed or names another location than audience, fails.
+func ParseDetails(raw json.RawMessage, typ, audience string) ([]Detail, error) {
+	if err := checkKeys(raw); err != nil {
 		return nil, err
 	}
-	dec := json.NewDecoder(bytes.NewReader(b))
+	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	var rows []Detail
 	if err := dec.Decode(&rows); err != nil {
-		return nil, fmt.Errorf("not an array of details: %w", err)
-	}
-	if rows == nil {
-		return nil, errors.New("must be an array")
+		return nil, err
 	}
 	out := []Detail{}
 	for i, d := range rows {
@@ -99,4 +101,88 @@ func (d Detail) check(audience string) error {
 		return errors.New("a row needs actions or tables")
 	}
 	return nil
+}
+
+// DetailsClaim returns the raw authorization_details value of a JWT payload; any duplicate top-level
+// key fails, so a second copy of the claim cannot win.
+func DetailsClaim(payload []byte) (raw json.RawMessage, found bool, err error) {
+	dec := json.NewDecoder(bytes.NewReader(payload))
+	err = object(dec, nil, func(key string) error {
+		if key != "authorization_details" {
+			return skip(dec)
+		}
+		found = true
+		return dec.Decode(&raw)
+	})
+	return raw, found, err
+}
+
+func checkKeys(raw []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	return array(dec, func() error {
+		return object(dec, rowKeys, func(key string) error {
+			if key != "tables" {
+				return skip(dec)
+			}
+			return array(dec, func() error {
+				return object(dec, ruleKeys, func(string) error { return skip(dec) })
+			})
+		})
+	})
+}
+
+func delim(dec *json.Decoder, want json.Delim, what string) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if tok != want {
+		return fmt.Errorf("must be %s", what)
+	}
+	return nil
+}
+
+func array(dec *json.Decoder, elem func() error) error {
+	if err := delim(dec, '[', "an array"); err != nil {
+		return err
+	}
+	for dec.More() {
+		if err := elem(); err != nil {
+			return err
+		}
+	}
+	_, err := dec.Token()
+	return err
+}
+
+// object walks one JSON object; allowed nil accepts any key, but every key may appear only once.
+func object(dec *json.Decoder, allowed []string, value func(key string) error) error {
+	if err := delim(dec, '{', "an object"); err != nil {
+		return err
+	}
+	seen := map[string]bool{}
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		key := tok.(string)
+		switch {
+		case allowed != nil && !slices.Contains(allowed, key):
+			return fmt.Errorf("unknown field %q", key)
+		case seen[key]:
+			return fmt.Errorf("duplicate field %q", key)
+		}
+		seen[key] = true
+		if err := value(key); err != nil {
+			return err
+		}
+	}
+	_, err := dec.Token()
+	return err
+}
+
+func skip(dec *json.Decoder) error {
+	var v json.RawMessage
+	return dec.Decode(&v)
 }

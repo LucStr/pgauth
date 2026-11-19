@@ -106,7 +106,9 @@ spec:
   owned sequences (serial and identity columns). A table verb is refused unless the group the binding
   would join already holds it (`<db>_read` for select, `<db>_write` otherwise, with `USAGE` on the
   schema and, for insert, the sequences), so table intent never reaches a table the binding cannot; a view or any other relation that is not
-  a table is refused.
+  a table is refused, and so is a table with row-level security (its policies name `<db>_read` /
+  `<db>_write`, not table groups). An issuer declaring `update` or `delete` should pair it with
+  `select` on the same table.
   Each verb on a table is a group role `pgauth_t_<hash16>` keyed by the table's OID (NOLOGIN, the verb,
   `USAGE` on the schema, `CONNECT` on the database) that pgauth creates and grants on first use and
   never drops; later connections only read the catalog, and a renamed or recreated table gets a new

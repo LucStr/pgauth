@@ -56,12 +56,16 @@ func readPrivileges(ctx context.Context, conn *pgx.Conn, role string, t rbac.Tab
 func (m *Manager) TableGroup(ctx context.Context, conn *pgx.Conn, db, bindingGroup string, t rbac.TableGrant) (string, error) {
 	var oid uint32
 	var kind string
-	if err := conn.QueryRow(ctx, "SELECT oid, relkind::text FROM pg_class WHERE oid = $1::text::regclass",
-		pgx.Identifier{t.Schema, t.Table}.Sanitize()).Scan(&oid, &kind); err != nil {
+	var rls bool
+	if err := conn.QueryRow(ctx, "SELECT oid, relkind::text, relrowsecurity FROM pg_class WHERE oid = $1::text::regclass",
+		pgx.Identifier{t.Schema, t.Table}.Sanitize()).Scan(&oid, &kind, &rls); err != nil {
 		return "", err
 	}
 	if kind != "r" && kind != "p" {
 		return "", fmt.Errorf("%s.%s is not a table", t.Schema, t.Table)
+	}
+	if rls {
+		return "", fmt.Errorf("%s.%s has row-level security, whose policies name the database groups, not table groups", t.Schema, t.Table)
 	}
 	name := m.tableGroupName(db, oid, t.Verb)
 	verb := strings.ToUpper(t.Verb)

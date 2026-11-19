@@ -35,16 +35,25 @@ func TestParseDetails(t *testing.T) {
 		{"table without schema", `[` + row(`"identifier":"main/order","tables":[{"name":"jobs","verbs":["select"]}]`) + `]`, "", "<schema>.<table>"},
 		{"table without verbs", `[` + row(`"identifier":"main/order","tables":[{"name":"public.jobs","verbs":[]}]`) + `]`, "", "no verbs"},
 		{"unknown verb", `[` + row(`"identifier":"main/order","tables":[{"name":"public.jobs","verbs":["truncate"]}]`) + `]`, "", "unknown verb"},
-		{"not an array", row(`"identifier":"*","actions":["read"]`), "", "not an array"},
+		{"not an array", row(`"identifier":"*","actions":["read"]`), "", "must be an array"},
 		{"null", `null`, "", "must be an array"},
+		{"long-s key folding onto actions", `[` + row(`"identifier":"*","actions":["read"],"actionſ":["write"]`) + `]`, "", "unknown field"},
+		{"capitalised key", `[` + row(`"identifier":"*","Actions":["write"]`) + `]`, "", "unknown field"},
+		{"duplicate key", `[` + row(`"identifier":"*","actions":["read"],"actions":["write"]`) + `]`, "", "duplicate field"},
+		{"duplicate key in a table rule", `[` + row(`"identifier":"main/order","tables":[{"name":"public.jobs","verbs":["select"],"verbs":["delete"]}]`) + `]`, "", "duplicate field"},
+		{"claim in a payload", `{"sub":"x","authorization_details":[` + row(`"identifier":"*","actions":["read"]`) + `]}`, "*", ""},
+		{"claim twice in a payload", `{"authorization_details":[],"authorization_details":[` + row(`"identifier":"*","actions":["write"]`) + `]}`, "", "duplicate field"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var raw any
-			if err := json.Unmarshal([]byte(tt.claim), &raw); err != nil {
-				t.Fatal(err)
+			raw, err := json.RawMessage(tt.claim), error(nil)
+			if strings.Contains(tt.claim, `"authorization_details"`) {
+				raw, _, err = DetailsClaim([]byte(tt.claim))
 			}
-			got, err := ParseDetails(raw, "postgres", aud)
+			var got []Detail
+			if err == nil {
+				got, err = ParseDetails(raw, "postgres", aud)
+			}
 			if tt.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 					t.Fatalf("error = %v, want %q", err, tt.wantErr)
