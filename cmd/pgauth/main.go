@@ -113,7 +113,7 @@ func serve(args []string) error {
 		go serveHealth(ctx, cfg.Health, srv, store, log)
 	}
 	if cfg.HTTP.Listen != "" {
-		hs := &http.Server{Addr: cfg.HTTP.Listen, Handler: api.New(cfg, verifier, store).Handler(), TLSConfig: tlsConfig, ReadHeaderTimeout: 5 * time.Second}
+		hs := &http.Server{Addr: cfg.HTTP.Listen, Handler: api.New(cfg, verifier, store, srv.Tables).Handler(), TLSConfig: tlsConfig, ReadHeaderTimeout: 5 * time.Second}
 		go func() {
 			<-ctx.Done()
 			_ = hs.Close()

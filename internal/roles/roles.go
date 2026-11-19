@@ -97,6 +97,9 @@ type Manager struct {
 
 	ownerConn *pgxpool.Conn // holds the owner lock while this process lives
 
+	// tableMu serializes table-group grants; concurrent GRANTs on one object can fail.
+	tableMu sync.Mutex
+
 	mu      sync.Mutex
 	current map[string]*entry // spec key → the role new connections get
 	byName  map[string]*entry // every role this process created and has not removed

@@ -25,6 +25,8 @@ type Claims struct {
 	Groups []string
 	Scopes []string
 	Expiry time.Time
+	// Details are the authorization_details rows of the configured type; nil when the token has no such claim.
+	Details []Detail
 }
 
 type Verifier struct {
@@ -124,6 +126,11 @@ func (v *Verifier) Verify(ctx context.Context, raw string) (Claims, error) {
 	}
 	if c.Scopes, err = stringList(scope, true); err != nil {
 		return Claims{}, fmt.Errorf("%w: claim scope: %v", ErrDenied, err)
+	}
+	if raw, ok := all["authorization_details"]; ok {
+		if c.Details, err = ParseDetails(raw, v.cfg.DetailsType, v.cfg.Audience); err != nil {
+			return Claims{}, fmt.Errorf("%w: claim authorization_details: %v", ErrDenied, err)
+		}
 	}
 	return c, nil
 }

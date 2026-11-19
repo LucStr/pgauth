@@ -21,8 +21,24 @@ The OAuth scope `postgres:read` or `postgres:write` a token was issued with; pga
 _Avoid_: agent ceiling, agent limit
 
 **Database token**:
-A short-lived token for the Postgres audience that proves who the holder is (user and groups) and carries a database scope; it lists no grants.
+A short-lived token for the Postgres audience that proves who the holder is (user and groups) and carries a database scope; it lists no grants, though its authorization details may narrow them.
 _Avoid_: JWT, access token, credential
+
+**Authorization details**:
+Rows in a database token that narrow access below the role bindings and the database scope, never above: consent rows per database, and table intent for one run.
+_Avoid_: RAR, permissions claim, token grants
+
+**Consent row**:
+An authorization detail a person chose for their agents: read or write on every database (`*`) or on one database. The row naming one database wins over `*`.
+_Avoid_: override, database scope
+
+**Table intent**:
+The tables and verbs (select, insert, update, delete) a run declares for one database; with it, that database reaches only those tables.
+_Avoid_: table scope, run scope, table grant
+
+**Table group**:
+A group role that carries one verb on one table, shared by every temporary role that needs it and never dropped.
+_Avoid_: table role, per-table grant
 
 **pgauth**:
 The proxy that accepts a database token as a Postgres password and connects on the holder's behalf.

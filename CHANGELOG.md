@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.7.0
+
+- **Authorization details** (RFC 9396, [ADR 0013](docs/adr/0013-authorization-details-narrow-to-tables.md)). Rows of type `oidc.detailsType` (default `postgres`) in a token's `authorization_details` narrow the bindings and scope cap: `actions` per `*` or `<instance>/<db>` (most specific wins), and `tables` (`<schema>.<table>` × select/insert/update/delete), after which that database reaches only those tables through lazily created group roles `pgauth_t_<hash8>`. Unknown fields, another location than the audience or a malformed row refuse the token. Tokens without the claim behave as in v0.6.0.
+- **Issuer grants for table intent:** the issuer needs table and schema privileges `WITH GRANT OPTION` (see README, Preparing an instance); without them only tokens with table intent are refused.
+- New `GET /v1/tables?db=<instance>/<db>` (bearer): tables with estimated row counts. `GET /v1/access` applies authorization details.
+- The connect record and span carry `tables`.
+
 ## v0.6.0
 
 Security release from an audit of v0.5.1–v0.5.2. Upgrading drops the previous version's temporary roles on the first sweep, ending their sessions.

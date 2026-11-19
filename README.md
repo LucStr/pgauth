@@ -12,9 +12,9 @@ psql "host=pgauth.example.com dbname=main/orders sslmode=verify-full" # password
 
 ## What pgauth is not
 
-- **Not a fine-grained authorization engine.** pgauth decides one thing: read, write or nothing on a
-  whole database, from role bindings (see [Access model](#access-model)). Table, row and column rules
-  stay in Postgres grants. Projects like [pgauthz](https://github.com/thomasdarimont/pgauthz) evaluate
+- **Not a fine-grained authorization engine.** pgauth decides read, write or nothing on a database,
+  from role bindings (see [Access model](#access-model)); a token's authorization details can only
+  narrow that, down to verbs on named tables. Row and column rules stay in Postgres grants. Projects like [pgauthz](https://github.com/thomasdarimont/pgauthz) evaluate
   authorization inside Postgres; pgauth does not.
 - **Not a connection pooler.** Every client connection is one upstream connection. PgBouncer or
   another pooler can sit behind pgauth if you need pooling.
@@ -30,8 +30,9 @@ psql "host=pgauth.example.com dbname=main/orders sslmode=verify-full" # password
    allowlist.
 4. The token names a user (`email` by default) and groups (`groups`). The role bindings decide the
    level on the requested database, the token's scope caps it (see [Access model](#access-model)),
-   and the level picks the group roles: read joins `<db>_read`, write joins `<db>_read` and
-   `<db>_write` (`groupRoles`). No access means no connection.
+   the token's authorization details may narrow it further, and the level picks the group roles: read
+   joins `<db>_read`, write joins `<db>_read` and `<db>_write` (`groupRoles`); table intent joins only
+   the table groups instead. No access means no connection.
 5. pgauth creates or reuses the temporary role `pgauth_<sub8>_<hash6>`, where `hash6` covers the
    subject, client, database, level and group roles. The role is a member of those group roles, of
    `pgauth_temp` and, when the instance sets `statsRole`, of that role, carries `COMMENT ON ROLE` with the full subject, user, client and creation time, and
@@ -85,6 +86,24 @@ spec:
 - **Scope cap.** After the bindings, the token's scope caps the level: `postgres:read` caps at read,
   `postgres:write` allows write, a token with neither is refused (`oidc.scopes` renames them). This is
   how a token issued to an agent stays read-only although its owner may write.
+- **Authorization details** ([RFC 9396](https://www.rfc-editor.org/rfc/rfc9396), [ADR 0013](docs/adr/0013-authorization-details-narrow-to-tables.md)).
+  A token with an `authorization_details` claim is narrowed by its rows of type `oidc.detailsType`
+  (default `postgres`); a token without the claim is unaffected.
+
+  ```json
+  [{"type":"postgres","locations":["<audience>"],"identifier":"*","actions":["read"]},
+   {"type":"postgres","locations":["<audience>"],"identifier":"cloudsql-main/order","actions":["read","write"]},
+   {"type":"postgres","locations":["<audience>"],"identifier":"cloudsql-main/order",
+    "tables":[{"name":"public.jobs","verbs":["update","select"]}]}]
+  ```
+
+  `locations` must be exactly the audience; `identifier` is `*` or `<instance>/<db>`, and rows for the
+  database win over `*`. `actions` (read, write) cap the level; `tables` (`<schema>.<table>`, verbs
+  select, insert, update, delete) limit that database to those tables. Verbs above the bindings, scope
+  or actions are dropped, and a database left with nothing is refused, as is a token whose claim has
+  an unknown field or a malformed row. The verb is granted literally: `UPDATE … WHERE` also needs
+  `select`. Each verb on a table is a group role `pgauth_t_<hash8>` (NOLOGIN, the verb plus `USAGE` on
+  the schema) that pgauth creates on first use and never drops.
 - **Reloading.** pgauth rereads the directory every `rbac.reloadInterval` (10s) and loads a change
   only after two identical reads 100 ms apart, so a file being written is picked up once it is
   complete. A set with any error is rejected as a whole and the last valid set stays live; a file with
@@ -132,6 +151,20 @@ GRANT SELECT ON ALL TABLES IN SCHEMA public TO <db>_read;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO <db>_write;
 ```
 
+For table intent ([authorization details](#access-model)) the issuer must also be able to grant
+table privileges; give them to the issuer directly, never `WITH GRANT OPTION` to `<db>_write`, which
+every write role joins:
+
+```sql
+-- per database <db>, connected to <db>, for every schema runs may name
+GRANT USAGE ON SCHEMA public TO pgauth WITH GRANT OPTION;
+ALTER DEFAULT PRIVILEGES FOR ROLE <db>_service
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO pgauth WITH GRANT OPTION;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO pgauth WITH GRANT OPTION;
+```
+
+Without them a token with table intent is refused with `the issuer cannot grant …`.
+
 pgauth needs only `ADMIN` on the groups. `INHERIT FALSE, SET FALSE` is the recommendation, so the issuer
 login holds none of the groups' rights itself, but it is optional: some tools (for example Terraform /
 OpenTofu Postgres providers) cannot express it, and plain `WITH ADMIN OPTION` works too. Temporary roles
@@ -174,10 +207,14 @@ values; `require` encrypts without verifying the server certificate, `verify-ca`
   - `GET /.well-known/pgauth` → `{postgres, issuer, audience, cli_client_id, scopes: {read, write},
     instances: [{name, databases}]}`, public, so a connector can set itself up from a host name.
   - `GET /v1/access` with `Authorization: Bearer <token>` → `[{instance, database, level}]`: every
-    database the token reaches, after the bindings and the scope cap.
+    database the token reaches, after the bindings, the scope cap and its authorization details.
+  - `GET /v1/tables?db=<instance>/<db>` with a bearer token → `[{schema, table, estimatedRows}]` from
+    `pg_class.reltuples` (partitions summed; never-analyzed tables use the live-tuple count), only the
+    declared tables when the token has table intent; 403 when the token cannot read the database.
 - **Audit:** every connection attempt writes one JSON log line and one OpenTelemetry span
   `pgauth.connect` with `sub`, `user`, `groups`, `client_id`, `instance`, `db`, `bindings`, `granted`
-  (level from the bindings), `level` (after the cap), `scope_cap`, `decision`, `reason`, `role` and duration. Query text is never recorded.
+  (level from the bindings), `level` (after the cap and authorization details), `scope_cap`, `tables` (`schema.table:verb` when
+  the token has table intent), `decision`, `reason`, `role` and duration. Query text is never recorded.
 - **Telemetry:** when the standard `OTEL_EXPORTER_OTLP_*` variables are set, spans, metrics and logs
   go out over OTLP with `service.name=pgauth`; `OTEL_LOGS_EXPORTER=none` (or `_TRACES_` / `_METRICS_`)
   switches one signal off. Every log line still goes to stdout as JSON as well, and the connect record

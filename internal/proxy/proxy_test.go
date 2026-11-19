@@ -78,11 +78,18 @@ func setupInDatabaseSQL(db string) []string {
 	return []string{
 		fmt.Sprintf(`GRANT USAGE, CREATE ON SCHEMA public TO %s_service`, db),
 		fmt.Sprintf(`GRANT USAGE ON SCHEMA public TO %s_read, %s_write`, db, db),
+		`GRANT USAGE ON SCHEMA public TO pgauth WITH GRANT OPTION`,
+		fmt.Sprintf(`ALTER DEFAULT PRIVILEGES FOR ROLE %s_service GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO pgauth WITH GRANT OPTION`, db),
+		fmt.Sprintf(`CREATE SCHEMA ops AUTHORIZATION %s_service`, db),
+		`GRANT USAGE ON SCHEMA ops TO pgauth WITH GRANT OPTION`,
 		fmt.Sprintf(`ALTER DEFAULT PRIVILEGES FOR ROLE %s_service IN SCHEMA public GRANT SELECT ON TABLES TO %s_read`, db, db),
 		fmt.Sprintf(`ALTER DEFAULT PRIVILEGES FOR ROLE %s_service IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO %s_write`, db, db),
 		fmt.Sprintf(`SET ROLE %s_service`, db),
 		`CREATE TABLE items (id int)`,
 		`INSERT INTO items VALUES (1)`,
+		`CREATE TABLE ops.jobs (id int, state text)`,
+		`INSERT INTO ops.jobs SELECT g, 'stuck' FROM generate_series(1, 500) g`,
+		`ANALYZE ops.jobs`,
 		`RESET ROLE`,
 	}
 }
@@ -244,7 +251,7 @@ func startServer(t *testing.T, mutate func(*config.Config)) (string, *rbac.Store
 		cancel()
 		<-done
 	})
-	apiSrv := httptest.NewUnstartedServer(api.New(cfg, verifier, store).Handler())
+	apiSrv := httptest.NewUnstartedServer(api.New(cfg, verifier, store, srv.Tables).Handler())
 	apiSrv.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
 	apiSrv.StartTLS()
 	t.Cleanup(apiSrv.Close)
@@ -332,6 +339,7 @@ type claims struct {
 	client   string
 	audience string
 	expired  bool
+	details  any // authorization_details claim, omitted when nil
 }
 
 func connect(ctx context.Context, addr, db string, c claims) (*pgx.Conn, error) {
@@ -503,6 +511,133 @@ func TestAPI(t *testing.T) {
 			}
 			if strings.Join(entries, ",") != tt.want {
 				t.Fatalf("access = %v, want %s", entries, tt.want)
+			}
+		})
+	}
+}
+
+// detail is one authorization_details row for the test audience; tables are "schema.table:verb,verb".
+func detail(id string, actions []string, tables ...string) map[string]any {
+	d := map[string]any{"type": "postgres", "locations": []string{audience}, "identifier": id}
+	if actions != nil {
+		d["actions"] = actions
+	}
+	var rules []map[string]any
+	for _, t := range tables {
+		name, verbs, _ := strings.Cut(t, ":")
+		rules = append(rules, map[string]any{"name": name, "verbs": strings.Split(verbs, ",")})
+	}
+	if rules != nil {
+		d["tables"] = rules
+	}
+	return d
+}
+
+func details(rows ...map[string]any) []map[string]any { return rows }
+
+func TestAuthorizationDetails(t *testing.T) {
+	addr, store, audit, _ := startServer(t, nil)
+	if err := store.Update([]rbac.File{{Name: "row.yaml", Data: []byte(adminBinding)}}); err != nil {
+		t.Fatal(err)
+	}
+	write := "postgres:write"
+	run := details(detail("*", []string{"read"}), detail("cloudsql-main/order", []string{"read", "write"}),
+		detail("cloudsql-main/order", nil, "ops.jobs:update", "public.items:select"))
+	tests := []struct {
+		name        string
+		claims      claims
+		stmt        string
+		wantConnect bool
+		wantStmt    bool
+		wantTables  string // the connect record's tables, when set
+	}{
+		{"declared update succeeds", claims{scope: write, details: run}, "UPDATE ops.jobs SET state = 'failed'", true, true, "ops.jobs:update,public.items:select"},
+		{"declared select succeeds", claims{scope: write, details: run}, "SELECT count(*) FROM items", true, true, ""},
+		{"undeclared update is denied", claims{scope: write, details: run}, "UPDATE items SET id = 2", true, false, ""},
+		{"update without select cannot read", claims{scope: write, details: run}, "SELECT count(*) FROM ops.jobs", true, false, ""},
+		{"update with WHERE needs select too", claims{scope: write, details: run}, "UPDATE ops.jobs SET state = 'failed' WHERE id = 1", true, false, ""},
+		{"update and select allow WHERE", claims{scope: write, details: details(detail("cloudsql-main/order", nil, "ops.jobs:update,select"))}, "UPDATE ops.jobs SET state = 'failed' WHERE id = 1", true, true, ""},
+		{"read scope drops the update", claims{details: run}, "UPDATE ops.jobs SET state = 'failed'", true, false, "public.items:select"},
+		{"consent * read caps write", claims{scope: write, details: details(detail("*", []string{"read"}))}, "UPDATE items SET id = 2", true, false, ""},
+		{"consent write on the database writes", claims{scope: write, details: details(detail("*", []string{"read"}), detail("cloudsql-main/order", []string{"write"}))}, "UPDATE items SET id = 2", true, true, ""},
+		{"claim without the database is denied", claims{scope: write, details: details(detail("cloudsql-main/assignment", []string{"write"}))}, "", false, false, ""},
+		{"unknown field is denied", claims{scope: write, details: details(map[string]any{"type": "postgres", "locations": []string{audience}, "identifier": "*", "actions": []string{"read"}, "privileges": "all"})}, "", false, false, ""},
+		{"details for another audience are denied", claims{details: details(map[string]any{"type": "postgres", "locations": []string{"https://other"}, "identifier": "*", "actions": []string{"read"}})}, "", false, false, ""},
+		{"undeclared table on a missing table fails the connection", claims{scope: write, details: details(detail("cloudsql-main/order", nil, "public.nope:select"))}, "", false, false, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			logged := audit.count()
+			conn, err := connect(ctx, addr, "cloudsql-main/order", tt.claims)
+			if (err == nil) != tt.wantConnect {
+				t.Fatalf("connect error = %v, want connect %v", err, tt.wantConnect)
+			}
+			if tt.wantTables != "" {
+				j, o := audit.after(t, logged)
+				var got []string
+				for _, v := range j["tables"].([]any) {
+					got = append(got, v.(string))
+				}
+				if strings.Join(got, ",") != tt.wantTables || o["tables"] != tt.wantTables {
+					t.Errorf("tables JSON %v / OTel %v, want %s", got, o["tables"], tt.wantTables)
+				}
+			}
+			if err != nil {
+				return
+			}
+			defer conn.Close(ctx)
+			_, err = conn.Exec(ctx, tt.stmt)
+			if (err == nil) != tt.wantStmt {
+				t.Fatalf("%q error = %v, want ok %v", tt.stmt, err, tt.wantStmt)
+			}
+			if err != nil && !strings.Contains(err.Error(), "permission denied") {
+				t.Fatalf("%q error = %v, want permission denied", tt.stmt, err)
+			}
+		})
+	}
+}
+
+func TestTables(t *testing.T) {
+	_, store, _, apiSrv := startServer(t, nil)
+	admins := binding("admins", "pg-admin", group("postgres-admins"))
+	mari := binding("mari", "cloudsql-main.order.read", user(defaultUser))
+	adm := []string{"postgres-admins"}
+	tests := []struct {
+		name     string
+		claims   claims
+		bindings string
+		db       string
+		code     int
+		want     string // schema.table:rows, comma-separated
+	}{
+		{"reader lists every table", claims{}, mari, "cloudsql-main/order", 200, "ops.jobs:500,public.items:1"},
+		{"no binding on the database", claims{}, mari, "cloudsql-main/assignment", 403, ""},
+		{"no postgres scope", claims{groups: adm, scope: "openid"}, admins, "cloudsql-main/order", 403, ""},
+		{"details without the database", claims{groups: adm, details: details(detail("cloudsql-main/assignment", []string{"read"}))}, admins, "cloudsql-main/order", 403, ""},
+		{"table rows list only those tables", claims{groups: adm, details: details(detail("cloudsql-main/order", nil, "ops.jobs:select"))}, admins, "cloudsql-main/order", 200, "ops.jobs:500"},
+		{"database not served", claims{groups: adm}, admins, "cloudsql-main/postgres", 404, ""},
+		{"no token", claims{user: "-"}, admins, "cloudsql-main/order", 401, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := store.Update([]rbac.File{{Name: "row.yaml", Data: []byte(tt.bindings)}}); err != nil {
+				t.Fatal(err)
+			}
+			bearer := ""
+			if tt.claims.user != "-" {
+				bearer = shared.issuer.token(tt.claims)
+			}
+			var got []api.Table
+			if code := getJSON(t, apiSrv, "/v1/tables?db="+tt.db, bearer, &got); code != tt.code {
+				t.Fatalf("status %d, want %d", code, tt.code)
+			}
+			var entries []string
+			for _, e := range got {
+				entries = append(entries, fmt.Sprintf("%s.%s:%d", e.Schema, e.Table, e.EstimatedRows))
+			}
+			if strings.Join(entries, ",") != tt.want {
+				t.Fatalf("tables = %v, want %s", entries, tt.want)
 			}
 		})
 	}
@@ -1274,11 +1409,15 @@ func (is *issuer) token(c claims) string {
 	if c.expired {
 		exp = time.Now().Add(-time.Minute)
 	}
-	raw, err := jwt.Signed(signer).Claims(map[string]any{
+	body := map[string]any{
 		"iss": is.srv.URL, "sub": "user-1234567890", "aud": c.audience, "client_id": c.client,
 		"exp": exp.Unix(), "iat": time.Now().Add(-time.Hour).Unix(),
 		"email": c.user, "groups": groupsClaim(c), "scope": c.scope,
-	}).Serialize()
+	}
+	if c.details != nil {
+		body["authorization_details"] = c.details
+	}
+	raw, err := jwt.Signed(signer).Claims(body).Serialize()
 	if err != nil {
 		panic(err)
 	}
