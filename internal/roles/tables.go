@@ -17,20 +17,39 @@ import (
 // TableGroupName is the group role holding one verb on one table; groups are shared and never dropped.
 func (m *Manager) TableGroupName(db string, t rbac.TableGrant) string {
 	h := sha256.Sum256([]byte(db + "\x00" + t.Schema + "\x00" + t.Table + "\x00" + t.Verb))
-	return m.opts.Prefix + "t_" + hex.EncodeToString(h[:4])
+	return m.opts.Prefix + "t_" + hex.EncodeToString(h[:8])
 }
 
-// TableGroup creates the table group for t if it is missing and grants it the verb and USAGE on the
-// schema. conn is the issuer connected to db. A grant the issuer cannot give (no GRANT OPTION) fails.
+// tableGroupState reports whether group exists and already holds verb on table, USAGE on schema and,
+// for insert, USAGE on the table's owned sequences; seqs are those sequences.
+const tableGroupState = `
+	WITH g AS (SELECT oid FROM pg_roles WHERE rolname = $1),
+	seqs AS (
+		SELECT s.oid FROM pg_depend d JOIN pg_class s ON s.oid = d.objid AND s.relkind = 'S'
+		WHERE d.classid = 'pg_class'::regclass AND d.refobjid = $3::text::regclass AND d.deptype IN ('a', 'i'))
+	SELECT EXISTS (SELECT 1 FROM g),
+		coalesce((SELECT has_schema_privilege(g.oid, $2::text, 'USAGE') AND has_table_privilege(g.oid, $3::text, $4::text)
+			AND ($4::text <> 'INSERT' OR NOT EXISTS (SELECT 1 FROM seqs WHERE NOT has_sequence_privilege(g.oid, seqs.oid, 'USAGE')))
+			FROM g), false),
+		ARRAY(SELECT oid::regclass::text FROM seqs ORDER BY 1)`
+
+// TableGroup returns the table group for t, creating it and granting the verb, USAGE on the schema and,
+// for insert, USAGE on owned sequences only when missing. conn is the issuer connected to db.
 func (m *Manager) TableGroup(ctx context.Context, conn *pgx.Conn, db string, t rbac.TableGrant) (string, error) {
-	m.tableMu.Lock()
-	defer m.tableMu.Unlock()
 	name := m.TableGroupName(db, t)
-	group := pgx.Identifier{name}.Sanitize()
-	var exists bool
-	if err := conn.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)", name).Scan(&exists); err != nil {
+	schema, table := pgx.Identifier{t.Schema}.Sanitize(), pgx.Identifier{t.Schema, t.Table}.Sanitize()
+	verb := strings.ToUpper(t.Verb)
+	var exists, ok bool
+	var seqs []string
+	state := func() error {
+		return conn.QueryRow(ctx, tableGroupState, name, t.Schema, table, verb).Scan(&exists, &ok, &seqs)
+	}
+	if err := state(); err != nil || ok {
 		return name, err
 	}
+	m.tableMu.Lock()
+	defer m.tableMu.Unlock()
+	group := pgx.Identifier{name}.Sanitize()
 	if !exists {
 		_, err := conn.Exec(ctx, "CREATE ROLE "+group+" NOLOGIN")
 		var pgErr *pgconn.PgError
@@ -38,16 +57,16 @@ func (m *Manager) TableGroup(ctx context.Context, conn *pgx.Conn, db string, t r
 			return name, err
 		}
 	}
-	schema, table := pgx.Identifier{t.Schema}.Sanitize(), pgx.Identifier{t.Schema, t.Table}.Sanitize()
-	verb := strings.ToUpper(t.Verb)
-	for _, stmt := range []string{"GRANT USAGE ON SCHEMA " + schema + " TO " + group, "GRANT " + verb + " ON " + table + " TO " + group} {
+	stmts := []string{"GRANT USAGE ON SCHEMA " + schema + " TO " + group, "GRANT " + verb + " ON " + table + " TO " + group}
+	if verb == "INSERT" && len(seqs) > 0 {
+		stmts = append(stmts, "GRANT USAGE ON SEQUENCE "+strings.Join(seqs, ", ")+" TO "+group)
+	}
+	for _, stmt := range stmts {
 		if _, err := conn.Exec(ctx, stmt); err != nil {
 			return name, err
 		}
 	}
-	var ok bool
-	if err := conn.QueryRow(ctx, "SELECT has_schema_privilege($1, $2, 'USAGE') AND has_table_privilege($1, $3, $4)",
-		name, t.Schema, table, verb).Scan(&ok); err != nil {
+	if err := state(); err != nil {
 		return name, err
 	}
 	if !ok {

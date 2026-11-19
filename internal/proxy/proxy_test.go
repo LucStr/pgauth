@@ -80,6 +80,7 @@ func setupInDatabaseSQL(db string) []string {
 		fmt.Sprintf(`GRANT USAGE ON SCHEMA public TO %s_read, %s_write`, db, db),
 		`GRANT USAGE ON SCHEMA public TO pgauth WITH GRANT OPTION`,
 		fmt.Sprintf(`ALTER DEFAULT PRIVILEGES FOR ROLE %s_service GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO pgauth WITH GRANT OPTION`, db),
+		fmt.Sprintf(`ALTER DEFAULT PRIVILEGES FOR ROLE %s_service GRANT USAGE ON SEQUENCES TO pgauth WITH GRANT OPTION`, db),
 		fmt.Sprintf(`CREATE SCHEMA ops AUTHORIZATION %s_service`, db),
 		`GRANT USAGE ON SCHEMA ops TO pgauth WITH GRANT OPTION`,
 		fmt.Sprintf(`ALTER DEFAULT PRIVILEGES FOR ROLE %s_service IN SCHEMA public GRANT SELECT ON TABLES TO %s_read`, db, db),
@@ -90,6 +91,7 @@ func setupInDatabaseSQL(db string) []string {
 		`CREATE TABLE ops.jobs (id int, state text)`,
 		`INSERT INTO ops.jobs SELECT g, 'stuck' FROM generate_series(1, 500) g`,
 		`ANALYZE ops.jobs`,
+		`CREATE TABLE ops.events (id int GENERATED ALWAYS AS IDENTITY, serial_id serial, note text)`,
 		`RESET ROLE`,
 	}
 }
@@ -563,6 +565,8 @@ func TestAuthorizationDetails(t *testing.T) {
 		{"claim without the database is denied", claims{scope: write, details: details(detail("cloudsql-main/assignment", []string{"write"}))}, "", false, false, ""},
 		{"unknown field is denied", claims{scope: write, details: details(map[string]any{"type": "postgres", "locations": []string{audience}, "identifier": "*", "actions": []string{"read"}, "privileges": "all"})}, "", false, false, ""},
 		{"details for another audience are denied", claims{details: details(map[string]any{"type": "postgres", "locations": []string{"https://other"}, "identifier": "*", "actions": []string{"read"}})}, "", false, false, ""},
+		{"insert uses the owned identity and serial sequences", claims{scope: write, details: details(detail("cloudsql-main/order", nil, "ops.events:insert"))}, "BEGIN; INSERT INTO ops.events (note) VALUES ('x'); ROLLBACK", true, true, "ops.events:insert"},
+		{"consent * read refuses a run insert", claims{scope: write, details: details(detail("*", []string{"read"}), detail("cloudsql-main/order", nil, "ops.events:insert"))}, "", false, false, ""},
 		{"undeclared table on a missing table fails the connection", claims{scope: write, details: details(detail("cloudsql-main/order", nil, "public.nope:select"))}, "", false, false, ""},
 	}
 	for _, tt := range tests {
@@ -611,7 +615,7 @@ func TestTables(t *testing.T) {
 		code     int
 		want     string // schema.table:rows, comma-separated
 	}{
-		{"reader lists every table", claims{}, mari, "cloudsql-main/order", 200, "ops.jobs:500,public.items:1"},
+		{"reader lists every table", claims{}, mari, "cloudsql-main/order", 200, "ops.events:0,ops.jobs:500,public.items:1"},
 		{"no binding on the database", claims{}, mari, "cloudsql-main/assignment", 403, ""},
 		{"no postgres scope", claims{groups: adm, scope: "openid"}, admins, "cloudsql-main/order", 403, ""},
 		{"details without the database", claims{groups: adm, details: details(detail("cloudsql-main/assignment", []string{"read"}))}, admins, "cloudsql-main/order", 403, ""},
@@ -648,14 +652,16 @@ func TestStatsRole(t *testing.T) {
 	for _, tt := range []struct {
 		name      string
 		statsRole string
+		details   any
 		member    bool
 	}{
-		{"stats role set: temporary roles join it", "pgauth_stats", true},
-		{"stats role unset: they do not", "", false},
+		{"stats role set: temporary roles join it", "pgauth_stats", nil, true},
+		{"stats role unset: they do not", "", nil, false},
+		{"table intent does not join it", "pgauth_stats", details(detail("cloudsql-main/order", nil, "public.items:select")), false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			addr, _, _, _ := startServer(t, func(cfg *config.Config) { cfg.Instances[0].StatsRole = tt.statsRole })
-			conn, err := connect(ctx, addr, "cloudsql-main/order", claims{})
+			conn, err := connect(ctx, addr, "cloudsql-main/order", claims{details: tt.details})
 			if err != nil {
 				t.Fatal(err)
 			}

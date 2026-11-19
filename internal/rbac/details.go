@@ -28,35 +28,29 @@ func verbLevel(verb string) Level {
 }
 
 // Effective narrows the bindings' level, capped by scope, by the token's authorization details. Nil
-// details mean the token has no claim and change nothing; rows for instance/db win over "*" rows.
+// details mean the token has no claim and change nothing. The consent level comes from rows naming
+// instance/db, else from "*" rows; table rows for instance/db keep only verbs within it.
 func Effective(granted, scopeCap Level, details []token.Detail, instance, db string) (Access, error) {
 	level := min(granted, scopeCap)
 	if details == nil || level == None {
 		return Access{Level: level}, nil
 	}
 	id := instance + "/" + db
-	var exact, wildcard []token.Detail
-	for _, d := range details {
-		switch d.Identifier {
-		case id:
-			exact = append(exact, d)
-		case "*":
-			wildcard = append(wildcard, d)
-		}
-	}
-	rows := exact
-	if len(rows) == 0 {
-		rows = wildcard
-	}
-	consent, hasConsent := None, false
+	exact, wildcard, hasExact, hasWildcard := None, None, false, false
 	var tables []TableGrant
-	for _, d := range rows {
+	for _, d := range details {
+		if d.Identifier != id && d.Identifier != "*" {
+			continue
+		}
 		for _, a := range d.Actions {
-			hasConsent = true
+			lv := Read
 			if a == "write" {
-				consent = max(consent, Write)
+				lv = Write
+			}
+			if d.Identifier == id {
+				exact, hasExact = max(exact, lv), true
 			} else {
-				consent = max(consent, Read)
+				wildcard, hasWildcard = max(wildcard, lv), true
 			}
 		}
 		for _, t := range d.Tables {
@@ -66,9 +60,12 @@ func Effective(granted, scopeCap Level, details []token.Detail, instance, db str
 			}
 		}
 	}
-	if hasConsent {
-		level = min(level, consent)
-	} else if len(tables) == 0 {
+	switch {
+	case hasExact:
+		level = min(level, exact)
+	case hasWildcard:
+		level = min(level, wildcard)
+	case len(tables) == 0:
 		return Access{}, fmt.Errorf("the token's authorization details grant nothing on %s", id)
 	}
 	if tables == nil {

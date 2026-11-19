@@ -425,7 +425,7 @@ func (s *Server) authorize(claims token.Claims, instName, db string) (*instance,
 			d.groupRoles = append(d.groupRoles, s.cfg.GroupRole("write", db))
 		}
 	}
-	if in.cfg.StatsRole != "" {
+	if in.cfg.StatsRole != "" && d.tables == nil {
 		d.groupRoles = append(d.groupRoles, in.cfg.StatsRole)
 	}
 	return in, d, ""

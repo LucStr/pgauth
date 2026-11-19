@@ -100,10 +100,13 @@ spec:
   `locations` must be exactly the audience; `identifier` is `*` or `<instance>/<db>`, and rows for the
   database win over `*`. `actions` (read, write) cap the level; `tables` (`<schema>.<table>`, verbs
   select, insert, update, delete) limit that database to those tables. Verbs above the bindings, scope
-  or actions are dropped, and a database left with nothing is refused, as is a token whose claim has
-  an unknown field or a malformed row. The verb is granted literally: `UPDATE … WHERE` also needs
-  `select`. Each verb on a table is a group role `pgauth_t_<hash8>` (NOLOGIN, the verb plus `USAGE` on
-  the schema) that pgauth creates on first use and never drops.
+  or consent level of that database (its own row, else `*`) are dropped, and a database left with
+  nothing is refused, as is a token whose claim has an unknown field or a malformed row. The verb is
+  granted literally: `UPDATE … WHERE` also needs `select`; `insert` also gets `USAGE` on the table's
+  owned sequences (serial and identity columns). Each verb on a table is a group role
+  `pgauth_t_<hash16>` (NOLOGIN, the verb plus `USAGE` on the schema) that pgauth creates and grants on
+  first use and never drops; later connections only read the catalog. A connection with table intent
+  does not join `statsRole`.
 - **Reloading.** pgauth rereads the directory every `rbac.reloadInterval` (10s) and loads a change
   only after two identical reads 100 ms apart, so a file being written is picked up once it is
   complete. A set with any error is rejected as a whole and the last valid set stays live; a file with
@@ -161,6 +164,8 @@ GRANT USAGE ON SCHEMA public TO pgauth WITH GRANT OPTION;
 ALTER DEFAULT PRIVILEGES FOR ROLE <db>_service
   GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO pgauth WITH GRANT OPTION;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO pgauth WITH GRANT OPTION;
+ALTER DEFAULT PRIVILEGES FOR ROLE <db>_service GRANT USAGE ON SEQUENCES TO pgauth WITH GRANT OPTION;
+GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO pgauth WITH GRANT OPTION;
 ```
 
 Without them a token with table intent is refused with `the issuer cannot grant …`.
