@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"slices"
 	"strings"
 )
@@ -42,9 +41,6 @@ func ParseDetails(raw any, typ, audience string) ([]Detail, error) {
 	var rows []Detail
 	if err := dec.Decode(&rows); err != nil {
 		return nil, fmt.Errorf("not an array of details: %w", err)
-	}
-	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-		return nil, errors.New("trailing data")
 	}
 	if rows == nil {
 		return nil, errors.New("must be an array")

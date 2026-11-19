@@ -36,6 +36,9 @@ import (
 
 const handshakeTimeout = 30 * time.Second
 
+// issuerTimeout bounds the issuer's dial and the table-group grants, which can queue behind locks.
+const issuerTimeout = 15 * time.Second
+
 type Server struct {
 	cfg      *config.Config
 	verifier *token.Verifier
@@ -433,6 +436,8 @@ func (s *Server) authorize(claims token.Claims, instName, db string) (*instance,
 
 // tableGroups ensures the table group of every grant, connected as the issuer to db.
 func (s *Server) tableGroups(ctx context.Context, in *instance, db string, tables []rbac.TableGrant) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, issuerTimeout)
+	defer cancel()
 	conn, err := s.issuerConn(ctx, in.cfg, db)
 	if err != nil {
 		return nil, err
@@ -464,7 +469,7 @@ func (s *Server) issuerConn(ctx context.Context, in config.Instance, db string) 
 		return nil, err
 	}
 	guard(&cfg.Config, in)
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, issuerTimeout)
 	defer cancel()
 	return pgx.ConnectConfig(ctx, cfg)
 }

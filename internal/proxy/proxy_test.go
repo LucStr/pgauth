@@ -96,6 +96,11 @@ func setupInDatabaseSQL(db string) []string {
 		`INSERT INTO jobs SELECT g, 'stuck' FROM generate_series(1, 500) g`,
 		`ANALYZE jobs`,
 		`CREATE TABLE events (id int GENERATED ALWAYS AS IDENTITY, serial_id serial, note text)`,
+		`CREATE VIEW items_view AS SELECT * FROM items`,
+		`CREATE TABLE plog (id int GENERATED ALWAYS AS IDENTITY, serial_id serial, at date NOT NULL) PARTITION BY RANGE (at)`,
+		`CREATE TABLE plog_2026 PARTITION OF plog FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')`,
+		`INSERT INTO plog (at) SELECT '2026-06-01' FROM generate_series(1, 3)`,
+		`ANALYZE plog_2026`,
 		`CREATE TABLE ops.jobs (id int, state text)`,
 		`RESET ROLE`,
 	}
@@ -570,6 +575,8 @@ func TestAuthorizationDetails(t *testing.T) {
 		{"update and select allow WHERE", claims{scope: write, details: details(detail("cloudsql-main/order", nil, "public.jobs:update,select"))}, "UPDATE jobs SET state = 'failed' WHERE id = 1", true, true, "", ""},
 		{"read scope drops the update", claims{details: run}, "UPDATE jobs SET state = 'failed'", true, false, "public.items:select", ""},
 		{"insert uses the owned identity and serial sequences", claims{scope: write, details: details(detail("cloudsql-main/order", nil, "public.events:insert"))}, "BEGIN; INSERT INTO events (note) VALUES ('x'); ROLLBACK", true, true, "public.events:insert", ""},
+		{"insert through a partitioned parent uses its sequences", claims{scope: write, details: details(detail("cloudsql-main/order", nil, "public.plog:insert"))}, "BEGIN; INSERT INTO plog (at) VALUES ('2026-07-01'); ROLLBACK", true, true, "public.plog:insert", ""},
+		{"a view is not a table", claims{details: details(detail("cloudsql-main/order", nil, "public.items_view:select"))}, "", false, false, "", ""},
 		{"table outside the binding's groups is denied", claims{scope: write, details: details(detail("cloudsql-main/order", nil, "ops.jobs:update"))}, "", false, false, "", ""},
 		{"consent * read refuses a run insert", claims{scope: write, details: details(detail("*", []string{"read"}), detail("cloudsql-main/order", nil, "public.events:insert"))}, "", false, false, "", ""},
 		{"consent * read caps write", claims{scope: write, details: details(detail("*", []string{"read"}))}, "UPDATE items SET id = 2", true, false, "", ""},
@@ -633,7 +640,7 @@ func TestTables(t *testing.T) {
 		code     int
 		want     string // schema.table:rows, comma-separated
 	}{
-		{"reader lists every table", claims{}, mari, "cloudsql-main/order", 200, "public.events:0,public.items:1,public.jobs:500"},
+		{"reader lists every table", claims{}, mari, "cloudsql-main/order", 200, "public.events:0,public.items:1,public.jobs:500,public.plog:3"},
 		{"no binding on the database", claims{}, mari, "cloudsql-main/assignment", 403, ""},
 		{"no postgres scope", claims{groups: adm, scope: "openid"}, admins, "cloudsql-main/order", 403, ""},
 		{"details without the database", claims{groups: adm, details: details(detail("cloudsql-main/assignment", []string{"read"}))}, admins, "cloudsql-main/order", 403, ""},

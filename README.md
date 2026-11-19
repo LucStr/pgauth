@@ -105,7 +105,8 @@ spec:
   granted literally: `UPDATE … WHERE` also needs `select`; `insert` also gets `USAGE` on the table's
   owned sequences (serial and identity columns). A table verb is refused unless the group the binding
   would join already holds it (`<db>_read` for select, `<db>_write` otherwise, with `USAGE` on the
-  schema and, for insert, the sequences), so table intent never reaches a table the binding cannot.
+  schema and, for insert, the sequences), so table intent never reaches a table the binding cannot; a view or any other relation that is not
+  a table is refused.
   Each verb on a table is a group role `pgauth_t_<hash16>` keyed by the table's OID (NOLOGIN, the verb,
   `USAGE` on the schema, `CONNECT` on the database) that pgauth creates and grants on first use and
   never drops; later connections only read the catalog, and a renamed or recreated table gets a new

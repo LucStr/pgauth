@@ -55,8 +55,13 @@ func readPrivileges(ctx context.Context, conn *pgx.Conn, role string, t rbac.Tab
 // intent never reaches a table the binding cannot. Missing grants are added; conn is the issuer on db.
 func (m *Manager) TableGroup(ctx context.Context, conn *pgx.Conn, db, bindingGroup string, t rbac.TableGrant) (string, error) {
 	var oid uint32
-	if err := conn.QueryRow(ctx, "SELECT $1::text::regclass::oid", pgx.Identifier{t.Schema, t.Table}.Sanitize()).Scan(&oid); err != nil {
+	var kind string
+	if err := conn.QueryRow(ctx, "SELECT oid, relkind::text FROM pg_class WHERE oid = $1::text::regclass",
+		pgx.Identifier{t.Schema, t.Table}.Sanitize()).Scan(&oid, &kind); err != nil {
 		return "", err
+	}
+	if kind != "r" && kind != "p" {
+		return "", fmt.Errorf("%s.%s is not a table", t.Schema, t.Table)
 	}
 	name := m.tableGroupName(db, oid, t.Verb)
 	verb := strings.ToUpper(t.Verb)
