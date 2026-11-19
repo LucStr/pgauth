@@ -84,6 +84,9 @@ type OIDC struct {
 	ClientIDClaim string `json:"clientIdClaim"`
 	// AllowedClients restricts the client a token was issued to; empty allows any.
 	AllowedClients []string `json:"allowedClients"`
+	// DetailsType is the authorization_details type (RFC 9396) pgauth enforces; a row of another type
+	// with an unknown or repeated key refuses the token, a well-formed one grants nothing here.
+	DetailsType string `json:"detailsType"`
 }
 
 // Scopes are the token scopes that cap access at read or allow write; a token with neither is refused.
@@ -165,6 +168,9 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.OIDC.Scopes.Write == "" {
 		c.OIDC.Scopes.Write = "postgres:write"
+	}
+	if c.OIDC.DetailsType == "" {
+		c.OIDC.DetailsType = "postgres"
 	}
 	if c.GroupRoles.Read == "" {
 		c.GroupRoles.Read = "{db}_read"

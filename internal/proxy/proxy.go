@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -26,6 +27,7 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/LucStr/pgauth/internal/api"
 	"github.com/LucStr/pgauth/internal/config"
 	"github.com/LucStr/pgauth/internal/rbac"
 	"github.com/LucStr/pgauth/internal/roles"
@@ -33,6 +35,9 @@ import (
 )
 
 const handshakeTimeout = 30 * time.Second
+
+// issuerTimeout bounds the issuer's dial and the table-group grants, which can queue behind locks.
+const issuerTimeout = 15 * time.Second
 
 type Server struct {
 	cfg      *config.Config
@@ -238,6 +243,7 @@ type attempt struct {
 	sub, user, clientID, instance, db, role string
 	groups, bindings                        []string
 	granted, level, scopeCap                string
+	tables                                  []string
 }
 
 func (s *Server) connect(conn net.Conn, backend *pgproto3.Backend, startup *pgproto3.StartupMessage) {
@@ -257,6 +263,7 @@ func (s *Server) connect(conn net.Conn, backend *pgproto3.Backend, startup *pgpr
 			attribute.String("pgauth.granted", a.granted),
 			attribute.String("pgauth.level", a.level),
 			attribute.String("pgauth.scope_cap", a.scopeCap),
+			attribute.StringSlice("pgauth.tables", a.tables),
 			attribute.String("pgauth.decision", decision),
 			attribute.String("pgauth.reason", reason),
 			attribute.String("pgauth.role", a.role),
@@ -267,7 +274,7 @@ func (s *Server) connect(conn net.Conn, backend *pgproto3.Backend, startup *pgpr
 		span.End()
 		s.log.InfoContext(ctx, "connect", "sub", a.sub, "user", a.user, "groups", a.groups, "client_id", a.clientID,
 			"instance", a.instance, "db", a.db, "bindings", a.bindings, "granted", a.granted, "level", a.level, "scope_cap", a.scopeCap,
-			"decision", decision, "reason", reason, "role", a.role, "duration_ms", d.Milliseconds())
+			"tables", a.tables, "decision", decision, "reason", reason, "role", a.role, "duration_ms", d.Milliseconds())
 	}
 
 	var dbOK bool
@@ -310,10 +317,22 @@ func (s *Server) connect(conn net.Conn, backend *pgproto3.Backend, startup *pgpr
 
 	in, d, reason := s.authorize(claims, a.instance, a.db)
 	a.bindings, a.granted, a.level, a.scopeCap = d.bindings, d.granted.String(), d.level.String(), d.scopeCap.String()
+	for _, t := range d.tables {
+		a.tables = append(a.tables, t.String())
+	}
 	if reason != "" {
 		finish("deny", reason)
 		fail(backend, "28000", "pgauth: "+reason)
 		return
+	}
+	if d.tables != nil {
+		groups, err := s.tableGroups(ctx, in, a.db, d.tables)
+		if err != nil {
+			finish("error", err.Error())
+			fail(backend, "28000", "pgauth: could not prepare the table grants: "+err.Error())
+			return
+		}
+		d.groupRoles = append(groups, d.groupRoles...)
 	}
 
 	if !s.admit(claims.Subject) {
@@ -360,15 +379,17 @@ func (s *Server) connect(conn net.Conn, backend *pgproto3.Backend, startup *pgpr
 }
 
 type decision struct {
-	bindings   []string
-	granted    rbac.Level // from the bindings, before the scope cap
-	level      rbac.Level // after the scope cap
-	scopeCap   rbac.Level
+	bindings []string
+	granted  rbac.Level // from the bindings, before the scope cap
+	level    rbac.Level // after the scope cap
+	scopeCap rbac.Level
+	// tables is nil for the whole database, else the only tables and verbs the connection gets.
+	tables     []rbac.TableGrant
 	groupRoles []string
 }
 
-// authorize decides the access level on instance/db from the role bindings, capped by the token's
-// scope, or returns a reason to deny.
+// authorize decides the access on instance/db from the role bindings, capped by the token's scope
+// and narrowed by its authorization details, or returns a reason to deny.
 func (s *Server) authorize(claims token.Claims, instName, db string) (*instance, decision, string) {
 	var d decision
 	in, ok := s.instances[instName]
@@ -395,14 +416,96 @@ func (s *Server) authorize(claims token.Claims, instName, db string) (*instance,
 	case d.scopeCap == rbac.None:
 		return nil, d, fmt.Sprintf("token has neither the %s nor the %s scope", s.cfg.OIDC.Scopes.Read, s.cfg.OIDC.Scopes.Write)
 	}
-	d.groupRoles = []string{s.cfg.GroupRole("read", db)}
-	if d.level == rbac.Write {
-		d.groupRoles = append(d.groupRoles, s.cfg.GroupRole("write", db))
+	access, err := rbac.Effective(d.granted, d.scopeCap, claims.Details, instName, db)
+	if err != nil {
+		d.level = rbac.None
+		return nil, d, err.Error()
 	}
-	if in.cfg.StatsRole != "" {
+	d.level, d.tables = access.Level, access.Tables
+	if d.tables == nil {
+		d.groupRoles = []string{s.cfg.GroupRole("read", db)}
+		if d.level == rbac.Write {
+			d.groupRoles = append(d.groupRoles, s.cfg.GroupRole("write", db))
+		}
+	}
+	if in.cfg.StatsRole != "" && d.tables == nil {
 		d.groupRoles = append(d.groupRoles, in.cfg.StatsRole)
 	}
 	return in, d, ""
+}
+
+// tableGroups ensures the table group of every grant, connected as the issuer to db.
+func (s *Server) tableGroups(ctx context.Context, in *instance, db string, tables []rbac.TableGrant) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, issuerTimeout)
+	defer cancel()
+	conn, err := s.issuerConn(ctx, in.cfg, db)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close(context.Background())
+	groups := make([]string, 0, len(tables))
+	for _, t := range tables {
+		level := "read"
+		if t.Verb != "select" {
+			level = "write"
+		}
+		g, err := in.roles.TableGroup(ctx, conn, db, s.cfg.GroupRole(level, db), t)
+		if err != nil {
+			return nil, err
+		}
+		groups = append(groups, g)
+	}
+	return groups, nil
+}
+
+// issuerConn connects the issuer login to db on in.
+func (s *Server) issuerConn(ctx context.Context, in config.Instance, db string) (*pgx.Conn, error) {
+	creds, err := in.Credentials()
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := pgx.ParseConfig(in.ConnString(creds.Username, creds.Password, db))
+	if err != nil {
+		return nil, err
+	}
+	guard(&cfg.Config, in)
+	ctx, cancel := context.WithTimeout(ctx, issuerTimeout)
+	defer cancel()
+	return pgx.ConnectConfig(ctx, cfg)
+}
+
+// Tables lists the tables of instance/db the read group can select, with their estimated rows; partitioned tables sum their
+// partitions, and a table never analyzed falls back to the live-tuple count.
+func (s *Server) Tables(ctx context.Context, instance, db string) ([]api.Table, error) {
+	in, ok := s.instances[instance]
+	if !ok || !in.cfg.Serves(db) {
+		return nil, fmt.Errorf("database %s/%s is not served", instance, db)
+	}
+	ctx, cancel := context.WithTimeout(ctx, issuerTimeout)
+	defer cancel()
+	conn, err := s.issuerConn(ctx, in.cfg, db)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close(context.Background())
+	rows, err := conn.Query(ctx, `
+		WITH est AS (
+			SELECT c.oid, CASE WHEN c.reltuples >= 0 THEN c.reltuples ELSE coalesce(st.n_live_tup, 0) END AS n
+			FROM pg_class c LEFT JOIN pg_stat_all_tables st ON st.relid = c.oid
+			WHERE c.relkind = 'r')
+		SELECT n.nspname, c.relname,
+			CASE WHEN c.relkind = 'p'
+				THEN (SELECT coalesce(sum(e.n), 0) FROM pg_partition_tree(c.oid) t JOIN est e ON e.oid = t.relid WHERE t.isleaf)
+				ELSE (SELECT e.n FROM est e WHERE e.oid = c.oid) END::bigint
+		FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE c.relkind IN ('r', 'p') AND NOT c.relispartition
+			AND n.nspname <> 'information_schema' AND NOT starts_with(n.nspname, 'pg_')
+			AND has_schema_privilege($1, n.oid, 'USAGE') AND has_table_privilege($1, c.oid, 'SELECT')
+		ORDER BY 1, 2`, s.cfg.GroupRole("read", db))
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowToStructByPos[api.Table])
 }
 
 // denial is the one-line reason a holder without a binding is refused, with where to ask for access.

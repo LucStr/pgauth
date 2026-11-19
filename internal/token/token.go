@@ -3,6 +3,7 @@ package token
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -25,6 +26,8 @@ type Claims struct {
 	Groups []string
 	Scopes []string
 	Expiry time.Time
+	// Details are the authorization_details rows of the configured type; nil when the token has no such claim.
+	Details []Detail
 }
 
 type Verifier struct {
@@ -124,6 +127,17 @@ func (v *Verifier) Verify(ctx context.Context, raw string) (Claims, error) {
 	}
 	if c.Scopes, err = stringList(scope, true); err != nil {
 		return Claims{}, fmt.Errorf("%w: claim scope: %v", ErrDenied, err)
+	}
+	var payload json.RawMessage
+	if err := tok.Claims(&payload); err != nil {
+		return Claims{}, fmt.Errorf("%w: unreadable claims", ErrDenied)
+	}
+	details, found, err := DetailsClaim(payload)
+	if err == nil && found {
+		c.Details, err = ParseDetails(details, v.cfg.DetailsType, v.cfg.Audience)
+	}
+	if err != nil {
+		return Claims{}, fmt.Errorf("%w: claim authorization_details: %v", ErrDenied, err)
 	}
 	return c, nil
 }

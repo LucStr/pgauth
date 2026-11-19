@@ -71,6 +71,9 @@ func setupDatabaseSQL(db string) []string {
 		fmt.Sprintf(`CREATE ROLE %s_read NOLOGIN`, db),
 		fmt.Sprintf(`CREATE ROLE %s_write NOLOGIN`, db),
 		fmt.Sprintf(`GRANT %s_read, %s_write TO pgauth WITH ADMIN OPTION`, db, db),
+		fmt.Sprintf(`REVOKE CONNECT, TEMPORARY ON DATABASE %q FROM PUBLIC`, db),
+		fmt.Sprintf(`GRANT CONNECT ON DATABASE %q TO %s_service, %s_read, %s_write`, db, db, db, db),
+		fmt.Sprintf(`GRANT CONNECT ON DATABASE %q TO pgauth WITH GRANT OPTION`, db),
 	}
 }
 
@@ -78,11 +81,29 @@ func setupInDatabaseSQL(db string) []string {
 	return []string{
 		fmt.Sprintf(`GRANT USAGE, CREATE ON SCHEMA public TO %s_service`, db),
 		fmt.Sprintf(`GRANT USAGE ON SCHEMA public TO %s_read, %s_write`, db, db),
+		`GRANT USAGE ON SCHEMA public TO pgauth WITH GRANT OPTION`,
+		fmt.Sprintf(`ALTER DEFAULT PRIVILEGES FOR ROLE %s_service GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO pgauth WITH GRANT OPTION`, db),
+		fmt.Sprintf(`ALTER DEFAULT PRIVILEGES FOR ROLE %s_service GRANT USAGE ON SEQUENCES TO pgauth WITH GRANT OPTION`, db),
+		fmt.Sprintf(`CREATE SCHEMA ops AUTHORIZATION %s_service`, db),
+		`GRANT USAGE ON SCHEMA ops TO pgauth WITH GRANT OPTION`,
 		fmt.Sprintf(`ALTER DEFAULT PRIVILEGES FOR ROLE %s_service IN SCHEMA public GRANT SELECT ON TABLES TO %s_read`, db, db),
 		fmt.Sprintf(`ALTER DEFAULT PRIVILEGES FOR ROLE %s_service IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO %s_write`, db, db),
+		fmt.Sprintf(`ALTER DEFAULT PRIVILEGES FOR ROLE %s_service IN SCHEMA public GRANT USAGE ON SEQUENCES TO %s_write`, db, db),
 		fmt.Sprintf(`SET ROLE %s_service`, db),
 		`CREATE TABLE items (id int)`,
 		`INSERT INTO items VALUES (1)`,
+		`CREATE TABLE jobs (id int, state text)`,
+		`INSERT INTO jobs SELECT g, 'stuck' FROM generate_series(1, 500) g`,
+		`ANALYZE jobs`,
+		`CREATE TABLE events (id int GENERATED ALWAYS AS IDENTITY, serial_id serial, note text)`,
+		`CREATE VIEW items_view AS SELECT * FROM items`,
+		`CREATE TABLE secured (id int)`,
+		`ALTER TABLE secured ENABLE ROW LEVEL SECURITY`,
+		`CREATE TABLE plog (id int GENERATED ALWAYS AS IDENTITY, serial_id serial, at date NOT NULL) PARTITION BY RANGE (at)`,
+		`CREATE TABLE plog_2026 PARTITION OF plog FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')`,
+		`INSERT INTO plog (at) SELECT '2026-06-01' FROM generate_series(1, 3)`,
+		`ANALYZE plog_2026`,
+		`CREATE TABLE ops.jobs (id int, state text)`,
 		`RESET ROLE`,
 	}
 }
@@ -244,7 +265,7 @@ func startServer(t *testing.T, mutate func(*config.Config)) (string, *rbac.Store
 		cancel()
 		<-done
 	})
-	apiSrv := httptest.NewUnstartedServer(api.New(cfg, verifier, store).Handler())
+	apiSrv := httptest.NewUnstartedServer(api.New(cfg, verifier, store, srv.Tables).Handler())
 	apiSrv.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
 	apiSrv.StartTLS()
 	t.Cleanup(apiSrv.Close)
@@ -332,6 +353,7 @@ type claims struct {
 	client   string
 	audience string
 	expired  bool
+	details  any // authorization_details claim, omitted when nil
 }
 
 func connect(ctx context.Context, addr, db string, c claims) (*pgx.Conn, error) {
@@ -508,19 +530,166 @@ func TestAPI(t *testing.T) {
 	}
 }
 
+// detail is one authorization_details row for the test audience; tables are "schema.table:verb,verb".
+func detail(id string, actions []string, tables ...string) map[string]any {
+	d := map[string]any{"type": "postgres", "locations": []string{audience}, "identifier": id}
+	if actions != nil {
+		d["actions"] = actions
+	}
+	var rules []map[string]any
+	for _, t := range tables {
+		name, verbs, _ := strings.Cut(t, ":")
+		rules = append(rules, map[string]any{"name": name, "verbs": strings.Split(verbs, ",")})
+	}
+	if rules != nil {
+		d["tables"] = rules
+	}
+	return d
+}
+
+func details(rows ...map[string]any) []map[string]any { return rows }
+
+func TestAuthorizationDetails(t *testing.T) {
+	addr, store, audit, _ := startServer(t, nil)
+	if err := store.Update([]rbac.File{{Name: "row.yaml", Data: []byte(adminBinding)}}); err != nil {
+		t.Fatal(err)
+	}
+	write := "postgres:write"
+	t.Cleanup(func() {
+		_ = execAll(context.Background(), strings.Replace(shared.adminDSN, "/postgres?", "/order?", 1), []string{"DROP TABLE IF EXISTS audit, audit_old"})
+	})
+	run := details(detail("*", []string{"read"}), detail("cloudsql-main/order", []string{"read", "write"}),
+		detail("cloudsql-main/order", nil, "public.jobs:update", "public.items:select"))
+	tests := []struct {
+		name        string
+		claims      claims
+		stmt        string
+		wantConnect bool
+		wantStmt    bool
+		wantTables  string // the connect record's tables, when set
+		before      string // run as the table owner in order first, when set
+	}{
+		{"declared update succeeds", claims{scope: write, details: run}, "UPDATE jobs SET state = 'failed'", true, true, "public.items:select,public.jobs:update", ""},
+		{"declared select succeeds", claims{scope: write, details: run}, "SELECT count(*) FROM items", true, true, "", ""},
+		{"undeclared update is denied", claims{scope: write, details: run}, "UPDATE items SET id = 2", true, false, "", ""},
+		{"update without select cannot read", claims{scope: write, details: run}, "SELECT count(*) FROM jobs", true, false, "", ""},
+		{"update with WHERE needs select too", claims{scope: write, details: run}, "UPDATE jobs SET state = 'failed' WHERE id = 1", true, false, "", ""},
+		{"update and select allow WHERE", claims{scope: write, details: details(detail("cloudsql-main/order", nil, "public.jobs:update,select"))}, "UPDATE jobs SET state = 'failed' WHERE id = 1", true, true, "", ""},
+		{"read scope drops the update", claims{details: run}, "UPDATE jobs SET state = 'failed'", true, false, "public.items:select", ""},
+		{"insert uses the owned identity and serial sequences", claims{scope: write, details: details(detail("cloudsql-main/order", nil, "public.events:insert"))}, "BEGIN; INSERT INTO events (note) VALUES ('x'); ROLLBACK", true, true, "public.events:insert", ""},
+		{"insert through a partitioned parent uses its sequences", claims{scope: write, details: details(detail("cloudsql-main/order", nil, "public.plog:insert"))}, "BEGIN; INSERT INTO plog (at) VALUES ('2026-07-01'); ROLLBACK", true, true, "public.plog:insert", ""},
+		{"a table with row-level security is refused", claims{details: details(detail("cloudsql-main/order", nil, "public.secured:select"))}, "", false, false, "", ""},
+		{"a view is not a table", claims{details: details(detail("cloudsql-main/order", nil, "public.items_view:select"))}, "", false, false, "", ""},
+		{"table outside the binding's groups is denied", claims{scope: write, details: details(detail("cloudsql-main/order", nil, "ops.jobs:update"))}, "", false, false, "", ""},
+		{"consent * read refuses a run insert", claims{scope: write, details: details(detail("*", []string{"read"}), detail("cloudsql-main/order", nil, "public.events:insert"))}, "", false, false, "", ""},
+		{"consent * read caps write", claims{scope: write, details: details(detail("*", []string{"read"}))}, "UPDATE items SET id = 2", true, false, "", ""},
+		{"consent write on the database writes", claims{scope: write, details: details(detail("*", []string{"read"}), detail("cloudsql-main/order", []string{"write"}))}, "UPDATE items SET id = 2", true, true, "", ""},
+		{"claim without the database is denied", claims{scope: write, details: details(detail("cloudsql-main/assignment", []string{"write"}))}, "", false, false, "", ""},
+		{"unknown field is denied", claims{scope: write, details: details(map[string]any{"type": "postgres", "locations": []string{audience}, "identifier": "*", "actions": []string{"read"}, "privileges": "all"})}, "", false, false, "", ""},
+		{"details for another audience are denied", claims{details: details(map[string]any{"type": "postgres", "locations": []string{"https://other"}, "identifier": "*", "actions": []string{"read"}})}, "", false, false, "", ""},
+		{"table group made for audit", claims{details: details(detail("cloudsql-main/order", nil, "public.audit:select"))}, "SELECT count(*) FROM audit", true, true, "", "SET ROLE order_service; CREATE TABLE audit (id int)"},
+		{"a renamed table keeps its group away from the new one", claims{details: details(detail("cloudsql-main/order", nil, "public.audit:select"))}, "SELECT count(*) FROM audit_old", true, false, "",
+			"SET ROLE order_service; ALTER TABLE audit RENAME TO audit_old; CREATE TABLE audit (id int)"},
+		{"missing table fails the connection", claims{scope: write, details: details(detail("cloudsql-main/order", nil, "public.nope:select"))}, "", false, false, "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			if tt.before != "" {
+				if err := execAll(ctx, strings.Replace(shared.adminDSN, "/postgres?", "/order?", 1), []string{tt.before}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			logged := audit.count()
+			conn, err := connect(ctx, addr, "cloudsql-main/order", tt.claims)
+			if (err == nil) != tt.wantConnect {
+				t.Fatalf("connect error = %v, want connect %v", err, tt.wantConnect)
+			}
+			if tt.wantTables != "" {
+				j, o := audit.after(t, logged)
+				var got []string
+				for _, v := range j["tables"].([]any) {
+					got = append(got, v.(string))
+				}
+				if strings.Join(got, ",") != tt.wantTables || o["tables"] != tt.wantTables {
+					t.Errorf("tables JSON %v / OTel %v, want %s", got, o["tables"], tt.wantTables)
+				}
+			}
+			if err != nil {
+				return
+			}
+			defer conn.Close(ctx)
+			_, err = conn.Exec(ctx, tt.stmt)
+			if (err == nil) != tt.wantStmt {
+				t.Fatalf("%q error = %v, want ok %v", tt.stmt, err, tt.wantStmt)
+			}
+			if err != nil && !strings.Contains(err.Error(), "permission denied") {
+				t.Fatalf("%q error = %v, want permission denied", tt.stmt, err)
+			}
+		})
+	}
+}
+
+func TestTables(t *testing.T) {
+	_, store, _, apiSrv := startServer(t, nil)
+	admins := binding("admins", "pg-admin", group("postgres-admins"))
+	mari := binding("mari", "cloudsql-main.order.read", user(defaultUser))
+	adm := []string{"postgres-admins"}
+	tests := []struct {
+		name     string
+		claims   claims
+		bindings string
+		db       string
+		code     int
+		want     string // schema.table:rows, comma-separated
+	}{
+		{"reader lists every table", claims{}, mari, "cloudsql-main/order", 200, "public.events:0,public.items:1,public.jobs:500,public.plog:3,public.secured:0"},
+		{"no binding on the database", claims{}, mari, "cloudsql-main/assignment", 403, ""},
+		{"no postgres scope", claims{groups: adm, scope: "openid"}, admins, "cloudsql-main/order", 403, ""},
+		{"details without the database", claims{groups: adm, details: details(detail("cloudsql-main/assignment", []string{"read"}))}, admins, "cloudsql-main/order", 403, ""},
+		{"table rows list only those tables", claims{groups: adm, details: details(detail("cloudsql-main/order", nil, "public.jobs:select"))}, admins, "cloudsql-main/order", 200, "public.jobs:500"},
+		{"database not served", claims{groups: adm}, admins, "cloudsql-main/postgres", 404, ""},
+		{"no token", claims{user: "-"}, admins, "cloudsql-main/order", 401, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := store.Update([]rbac.File{{Name: "row.yaml", Data: []byte(tt.bindings)}}); err != nil {
+				t.Fatal(err)
+			}
+			bearer := ""
+			if tt.claims.user != "-" {
+				bearer = shared.issuer.token(tt.claims)
+			}
+			var got []api.Table
+			if code := getJSON(t, apiSrv, "/v1/tables?db="+tt.db, bearer, &got); code != tt.code {
+				t.Fatalf("status %d, want %d", code, tt.code)
+			}
+			var entries []string
+			for _, e := range got {
+				entries = append(entries, fmt.Sprintf("%s.%s:%d", e.Schema, e.Table, e.EstimatedRows))
+			}
+			if strings.Join(entries, ",") != tt.want {
+				t.Fatalf("tables = %v, want %s", entries, tt.want)
+			}
+		})
+	}
+}
+
 func TestStatsRole(t *testing.T) {
 	ctx := context.Background()
 	for _, tt := range []struct {
 		name      string
 		statsRole string
+		details   any
 		member    bool
 	}{
-		{"stats role set: temporary roles join it", "pgauth_stats", true},
-		{"stats role unset: they do not", "", false},
+		{"stats role set: temporary roles join it", "pgauth_stats", nil, true},
+		{"stats role unset: they do not", "", nil, false},
+		{"table intent does not join it", "pgauth_stats", details(detail("cloudsql-main/order", nil, "public.items:select")), false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			addr, _, _, _ := startServer(t, func(cfg *config.Config) { cfg.Instances[0].StatsRole = tt.statsRole })
-			conn, err := connect(ctx, addr, "cloudsql-main/order", claims{})
+			conn, err := connect(ctx, addr, "cloudsql-main/order", claims{details: tt.details})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1274,11 +1443,15 @@ func (is *issuer) token(c claims) string {
 	if c.expired {
 		exp = time.Now().Add(-time.Minute)
 	}
-	raw, err := jwt.Signed(signer).Claims(map[string]any{
+	body := map[string]any{
 		"iss": is.srv.URL, "sub": "user-1234567890", "aud": c.audience, "client_id": c.client,
 		"exp": exp.Unix(), "iat": time.Now().Add(-time.Hour).Unix(),
 		"email": c.user, "groups": groupsClaim(c), "scope": c.scope,
-	}).Serialize()
+	}
+	if c.details != nil {
+		body["authorization_details"] = c.details
+	}
+	raw, err := jwt.Signed(signer).Claims(body).Serialize()
 	if err != nil {
 		panic(err)
 	}
