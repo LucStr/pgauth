@@ -440,7 +440,11 @@ func (s *Server) tableGroups(ctx context.Context, in *instance, db string, table
 	defer conn.Close(context.Background())
 	groups := make([]string, 0, len(tables))
 	for _, t := range tables {
-		g, err := in.roles.TableGroup(ctx, conn, db, t)
+		level := "read"
+		if t.Verb != "select" {
+			level = "write"
+		}
+		g, err := in.roles.TableGroup(ctx, conn, db, s.cfg.GroupRole(level, db), t)
 		if err != nil {
 			return nil, err
 		}
@@ -465,7 +469,7 @@ func (s *Server) issuerConn(ctx context.Context, in config.Instance, db string) 
 	return pgx.ConnectConfig(ctx, cfg)
 }
 
-// Tables lists the tables of instance/db with their estimated rows; partitioned tables sum their
+// Tables lists the tables of instance/db the read group can select, with their estimated rows; partitioned tables sum their
 // partitions, and a table never analyzed falls back to the live-tuple count.
 func (s *Server) Tables(ctx context.Context, instance, db string) ([]api.Table, error) {
 	in, ok := s.instances[instance]
@@ -489,7 +493,8 @@ func (s *Server) Tables(ctx context.Context, instance, db string) ([]api.Table, 
 		FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 		WHERE c.relkind IN ('r', 'p') AND NOT c.relispartition
 			AND n.nspname <> 'information_schema' AND NOT starts_with(n.nspname, 'pg_')
-		ORDER BY 1, 2`)
+			AND has_schema_privilege($1, n.oid, 'USAGE') AND has_table_privilege($1, c.oid, 'SELECT')
+		ORDER BY 1, 2`, s.cfg.GroupRole("read", db))
 	if err != nil {
 		return nil, err
 	}

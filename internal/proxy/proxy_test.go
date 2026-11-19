@@ -71,6 +71,9 @@ func setupDatabaseSQL(db string) []string {
 		fmt.Sprintf(`CREATE ROLE %s_read NOLOGIN`, db),
 		fmt.Sprintf(`CREATE ROLE %s_write NOLOGIN`, db),
 		fmt.Sprintf(`GRANT %s_read, %s_write TO pgauth WITH ADMIN OPTION`, db, db),
+		fmt.Sprintf(`REVOKE CONNECT, TEMPORARY ON DATABASE %q FROM PUBLIC`, db),
+		fmt.Sprintf(`GRANT CONNECT ON DATABASE %q TO %s_service, %s_read, %s_write`, db, db, db, db),
+		fmt.Sprintf(`GRANT CONNECT ON DATABASE %q TO pgauth WITH GRANT OPTION`, db),
 	}
 }
 
@@ -85,13 +88,15 @@ func setupInDatabaseSQL(db string) []string {
 		`GRANT USAGE ON SCHEMA ops TO pgauth WITH GRANT OPTION`,
 		fmt.Sprintf(`ALTER DEFAULT PRIVILEGES FOR ROLE %s_service IN SCHEMA public GRANT SELECT ON TABLES TO %s_read`, db, db),
 		fmt.Sprintf(`ALTER DEFAULT PRIVILEGES FOR ROLE %s_service IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO %s_write`, db, db),
+		fmt.Sprintf(`ALTER DEFAULT PRIVILEGES FOR ROLE %s_service IN SCHEMA public GRANT USAGE ON SEQUENCES TO %s_write`, db, db),
 		fmt.Sprintf(`SET ROLE %s_service`, db),
 		`CREATE TABLE items (id int)`,
 		`INSERT INTO items VALUES (1)`,
+		`CREATE TABLE jobs (id int, state text)`,
+		`INSERT INTO jobs SELECT g, 'stuck' FROM generate_series(1, 500) g`,
+		`ANALYZE jobs`,
+		`CREATE TABLE events (id int GENERATED ALWAYS AS IDENTITY, serial_id serial, note text)`,
 		`CREATE TABLE ops.jobs (id int, state text)`,
-		`INSERT INTO ops.jobs SELECT g, 'stuck' FROM generate_series(1, 500) g`,
-		`ANALYZE ops.jobs`,
-		`CREATE TABLE ops.events (id int GENERATED ALWAYS AS IDENTITY, serial_id serial, note text)`,
 		`RESET ROLE`,
 	}
 }
@@ -543,8 +548,11 @@ func TestAuthorizationDetails(t *testing.T) {
 		t.Fatal(err)
 	}
 	write := "postgres:write"
+	t.Cleanup(func() {
+		_ = execAll(context.Background(), strings.Replace(shared.adminDSN, "/postgres?", "/order?", 1), []string{"DROP TABLE IF EXISTS audit, audit_old"})
+	})
 	run := details(detail("*", []string{"read"}), detail("cloudsql-main/order", []string{"read", "write"}),
-		detail("cloudsql-main/order", nil, "ops.jobs:update", "public.items:select"))
+		detail("cloudsql-main/order", nil, "public.jobs:update", "public.items:select"))
 	tests := []struct {
 		name        string
 		claims      claims
@@ -552,26 +560,36 @@ func TestAuthorizationDetails(t *testing.T) {
 		wantConnect bool
 		wantStmt    bool
 		wantTables  string // the connect record's tables, when set
+		before      string // run as the table owner in order first, when set
 	}{
-		{"declared update succeeds", claims{scope: write, details: run}, "UPDATE ops.jobs SET state = 'failed'", true, true, "ops.jobs:update,public.items:select"},
-		{"declared select succeeds", claims{scope: write, details: run}, "SELECT count(*) FROM items", true, true, ""},
-		{"undeclared update is denied", claims{scope: write, details: run}, "UPDATE items SET id = 2", true, false, ""},
-		{"update without select cannot read", claims{scope: write, details: run}, "SELECT count(*) FROM ops.jobs", true, false, ""},
-		{"update with WHERE needs select too", claims{scope: write, details: run}, "UPDATE ops.jobs SET state = 'failed' WHERE id = 1", true, false, ""},
-		{"update and select allow WHERE", claims{scope: write, details: details(detail("cloudsql-main/order", nil, "ops.jobs:update,select"))}, "UPDATE ops.jobs SET state = 'failed' WHERE id = 1", true, true, ""},
-		{"read scope drops the update", claims{details: run}, "UPDATE ops.jobs SET state = 'failed'", true, false, "public.items:select"},
-		{"consent * read caps write", claims{scope: write, details: details(detail("*", []string{"read"}))}, "UPDATE items SET id = 2", true, false, ""},
-		{"consent write on the database writes", claims{scope: write, details: details(detail("*", []string{"read"}), detail("cloudsql-main/order", []string{"write"}))}, "UPDATE items SET id = 2", true, true, ""},
-		{"claim without the database is denied", claims{scope: write, details: details(detail("cloudsql-main/assignment", []string{"write"}))}, "", false, false, ""},
-		{"unknown field is denied", claims{scope: write, details: details(map[string]any{"type": "postgres", "locations": []string{audience}, "identifier": "*", "actions": []string{"read"}, "privileges": "all"})}, "", false, false, ""},
-		{"details for another audience are denied", claims{details: details(map[string]any{"type": "postgres", "locations": []string{"https://other"}, "identifier": "*", "actions": []string{"read"}})}, "", false, false, ""},
-		{"insert uses the owned identity and serial sequences", claims{scope: write, details: details(detail("cloudsql-main/order", nil, "ops.events:insert"))}, "BEGIN; INSERT INTO ops.events (note) VALUES ('x'); ROLLBACK", true, true, "ops.events:insert"},
-		{"consent * read refuses a run insert", claims{scope: write, details: details(detail("*", []string{"read"}), detail("cloudsql-main/order", nil, "ops.events:insert"))}, "", false, false, ""},
-		{"undeclared table on a missing table fails the connection", claims{scope: write, details: details(detail("cloudsql-main/order", nil, "public.nope:select"))}, "", false, false, ""},
+		{"declared update succeeds", claims{scope: write, details: run}, "UPDATE jobs SET state = 'failed'", true, true, "public.items:select,public.jobs:update", ""},
+		{"declared select succeeds", claims{scope: write, details: run}, "SELECT count(*) FROM items", true, true, "", ""},
+		{"undeclared update is denied", claims{scope: write, details: run}, "UPDATE items SET id = 2", true, false, "", ""},
+		{"update without select cannot read", claims{scope: write, details: run}, "SELECT count(*) FROM jobs", true, false, "", ""},
+		{"update with WHERE needs select too", claims{scope: write, details: run}, "UPDATE jobs SET state = 'failed' WHERE id = 1", true, false, "", ""},
+		{"update and select allow WHERE", claims{scope: write, details: details(detail("cloudsql-main/order", nil, "public.jobs:update,select"))}, "UPDATE jobs SET state = 'failed' WHERE id = 1", true, true, "", ""},
+		{"read scope drops the update", claims{details: run}, "UPDATE jobs SET state = 'failed'", true, false, "public.items:select", ""},
+		{"insert uses the owned identity and serial sequences", claims{scope: write, details: details(detail("cloudsql-main/order", nil, "public.events:insert"))}, "BEGIN; INSERT INTO events (note) VALUES ('x'); ROLLBACK", true, true, "public.events:insert", ""},
+		{"table outside the binding's groups is denied", claims{scope: write, details: details(detail("cloudsql-main/order", nil, "ops.jobs:update"))}, "", false, false, "", ""},
+		{"consent * read refuses a run insert", claims{scope: write, details: details(detail("*", []string{"read"}), detail("cloudsql-main/order", nil, "public.events:insert"))}, "", false, false, "", ""},
+		{"consent * read caps write", claims{scope: write, details: details(detail("*", []string{"read"}))}, "UPDATE items SET id = 2", true, false, "", ""},
+		{"consent write on the database writes", claims{scope: write, details: details(detail("*", []string{"read"}), detail("cloudsql-main/order", []string{"write"}))}, "UPDATE items SET id = 2", true, true, "", ""},
+		{"claim without the database is denied", claims{scope: write, details: details(detail("cloudsql-main/assignment", []string{"write"}))}, "", false, false, "", ""},
+		{"unknown field is denied", claims{scope: write, details: details(map[string]any{"type": "postgres", "locations": []string{audience}, "identifier": "*", "actions": []string{"read"}, "privileges": "all"})}, "", false, false, "", ""},
+		{"details for another audience are denied", claims{details: details(map[string]any{"type": "postgres", "locations": []string{"https://other"}, "identifier": "*", "actions": []string{"read"}})}, "", false, false, "", ""},
+		{"table group made for audit", claims{details: details(detail("cloudsql-main/order", nil, "public.audit:select"))}, "SELECT count(*) FROM audit", true, true, "", "SET ROLE order_service; CREATE TABLE audit (id int)"},
+		{"a renamed table keeps its group away from the new one", claims{details: details(detail("cloudsql-main/order", nil, "public.audit:select"))}, "SELECT count(*) FROM audit_old", true, false, "",
+			"SET ROLE order_service; ALTER TABLE audit RENAME TO audit_old; CREATE TABLE audit (id int)"},
+		{"missing table fails the connection", claims{scope: write, details: details(detail("cloudsql-main/order", nil, "public.nope:select"))}, "", false, false, "", ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := context.Background()
+			if tt.before != "" {
+				if err := execAll(ctx, strings.Replace(shared.adminDSN, "/postgres?", "/order?", 1), []string{tt.before}); err != nil {
+					t.Fatal(err)
+				}
+			}
 			logged := audit.count()
 			conn, err := connect(ctx, addr, "cloudsql-main/order", tt.claims)
 			if (err == nil) != tt.wantConnect {
@@ -615,11 +633,11 @@ func TestTables(t *testing.T) {
 		code     int
 		want     string // schema.table:rows, comma-separated
 	}{
-		{"reader lists every table", claims{}, mari, "cloudsql-main/order", 200, "ops.events:0,ops.jobs:500,public.items:1"},
+		{"reader lists every table", claims{}, mari, "cloudsql-main/order", 200, "public.events:0,public.items:1,public.jobs:500"},
 		{"no binding on the database", claims{}, mari, "cloudsql-main/assignment", 403, ""},
 		{"no postgres scope", claims{groups: adm, scope: "openid"}, admins, "cloudsql-main/order", 403, ""},
 		{"details without the database", claims{groups: adm, details: details(detail("cloudsql-main/assignment", []string{"read"}))}, admins, "cloudsql-main/order", 403, ""},
-		{"table rows list only those tables", claims{groups: adm, details: details(detail("cloudsql-main/order", nil, "ops.jobs:select"))}, admins, "cloudsql-main/order", 200, "ops.jobs:500"},
+		{"table rows list only those tables", claims{groups: adm, details: details(detail("cloudsql-main/order", nil, "public.jobs:select"))}, admins, "cloudsql-main/order", 200, "public.jobs:500"},
 		{"database not served", claims{groups: adm}, admins, "cloudsql-main/postgres", 404, ""},
 		{"no token", claims{user: "-"}, admins, "cloudsql-main/order", 401, ""},
 	}
