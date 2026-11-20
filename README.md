@@ -88,7 +88,11 @@ spec:
   how a token issued to an agent stays read-only although its owner may write.
 - **Authorization details** ([RFC 9396](https://www.rfc-editor.org/rfc/rfc9396), [ADR 0013](docs/adr/0013-authorization-details-narrow-to-tables.md)).
   A token with an `authorization_details` claim is narrowed by its rows of type `oidc.detailsType`
-  (default `postgres`); a token without the claim is unaffected.
+  (default `postgres`); a token without the claim is unaffected, unless its client is listed in
+  `oidc.requireDetailsClients`: such a token without the claim is refused, so an agent client can
+  never fall back to its owner's full bindings (Rapidata lists `poseidon-session` and `poseidon-run`;
+  `pgauth-cli` stays claim-free). A connection with table intent lives at most until the token's
+  `exp`, not `maxConnectionAge`.
 
   ```json
   [{"type":"postgres","locations":["<audience>"],"identifier":"*","actions":["read"]},
@@ -204,6 +208,16 @@ also keep temporary roles out of other databases at the Postgres level:
 ```sql
 REVOKE CONNECT, TEMPORARY ON DATABASE <db> FROM PUBLIC;
 GRANT CONNECT ON DATABASE <db> TO <db>_service, <db>_read, <db>_write; -- plus every other login that uses <db>
+```
+
+A role limited to table intent still holds `USAGE` on the named schema and everything `PUBLIC` holds:
+`EXECUTE` on functions (including `SECURITY DEFINER` ones, which run as their owner), any table grants
+to `PUBLIC`, and `TEMP`. To keep table intent at the declared tables, revoke those in served schemas:
+
+```sql
+REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC;
+ALTER DEFAULT PRIVILEGES FOR ROLE <db>_service REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+-- and grant no table privileges to PUBLIC in schemas pgauth serves
 ```
 
 ## Running

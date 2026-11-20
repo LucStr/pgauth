@@ -22,6 +22,7 @@ oidc:
     read: postgres:read              #   caps access at read
     write: postgres:write            #   allows write where a binding grants it
   clientIdClaim: client_id           # default; falls back to azp
+  requireDetailsClients: []           # clients whose tokens must carry authorization_details (e.g. agent clients)
   detailsType: postgres              # default; authorization_details rows of this type narrow access
   allowedClients: []                 # empty allows any client
 
