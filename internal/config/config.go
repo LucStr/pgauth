@@ -84,6 +84,8 @@ type OIDC struct {
 	ClientIDClaim string `json:"clientIdClaim"`
 	// AllowedClients restricts the client a token was issued to; empty allows any.
 	AllowedClients []string `json:"allowedClients"`
+	// RequireDetailsClients lists clients whose tokens must carry authorization_details; others may omit it.
+	RequireDetailsClients []string `json:"requireDetailsClients"`
 	// DetailsType is the authorization_details type (RFC 9396) pgauth enforces; a row of another type
 	// with an unknown or repeated key refuses the token, a well-formed one grants nothing here.
 	DetailsType string `json:"detailsType"`

@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.7.1
+
+- `oidc.requireDetailsClients`: tokens from these clients (`client_id`/`azp`) must carry `authorization_details`, or they are refused. Default empty.
+- A connection with table intent ends at the token's `exp` instead of `maxConnectionAge`.
+- README: what a table-intent role still gets through `PUBLIC` (function `EXECUTE`, `PUBLIC` table grants, `TEMP`) and how to revoke it.
+
 ## v0.7.0
 
 - **Authorization details** (RFC 9396, [ADR 0013](docs/adr/0013-authorization-details-narrow-to-tables.md)). Rows of type `oidc.detailsType` (default `postgres`) in a token's `authorization_details` narrow the bindings and scope cap: `actions` per `*` or `<instance>/<db>` (most specific wins), and `tables` (`<schema>.<table>` × select/insert/update/delete), after which that database reaches only those tables through lazily created group roles `pgauth_t_<hash16>` keyed by table OID (insert also gets the table's owned sequences; table intent does not join `statsRole`). A table verb is refused unless `<db>_read` (select) or `<db>_write` already holds it, and only tables (plain or partitioned) without row-level security can be named. Claim keys must match exactly and appear once (encoding/json would fold case and let duplicates win). Unknown fields, another location than the audience or a malformed row refuse the token. Tokens without the claim behave as in v0.6.0.

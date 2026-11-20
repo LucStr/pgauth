@@ -375,7 +375,11 @@ func (s *Server) connect(conn net.Conn, backend *pgproto3.Backend, startup *pgpr
 	finish("allow", "")
 
 	_ = conn.SetDeadline(time.Time{})
-	splice(conn, upstream.Conn, time.Duration(s.cfg.MaxConnectionAge), s.stopping)
+	maxAge := time.Duration(s.cfg.MaxConnectionAge)
+	if d.tables != nil && !claims.Expiry.IsZero() {
+		maxAge = min(maxAge, time.Until(claims.Expiry))
+	}
+	splice(conn, upstream.Conn, maxAge, s.stopping)
 }
 
 type decision struct {

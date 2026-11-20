@@ -139,6 +139,9 @@ func (v *Verifier) Verify(ctx context.Context, raw string) (Claims, error) {
 	if err != nil {
 		return Claims{}, fmt.Errorf("%w: claim authorization_details: %v", ErrDenied, err)
 	}
+	if !found && slices.Contains(v.cfg.RequireDetailsClients, c.ClientID) {
+		return Claims{}, fmt.Errorf("%w: client %q must send authorization_details", ErrDenied, c.ClientID)
+	}
 	return c, nil
 }
 

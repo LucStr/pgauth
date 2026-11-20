@@ -353,7 +353,8 @@ type claims struct {
 	client   string
 	audience string
 	expired  bool
-	details  any // authorization_details claim, omitted when nil
+	ttl      time.Duration // token lifetime, default 15m
+	details  any           // authorization_details claim, omitted when nil
 }
 
 func connect(ctx context.Context, addr, db string, c claims) (*pgx.Conn, error) {
@@ -550,7 +551,10 @@ func detail(id string, actions []string, tables ...string) map[string]any {
 func details(rows ...map[string]any) []map[string]any { return rows }
 
 func TestAuthorizationDetails(t *testing.T) {
-	addr, store, audit, _ := startServer(t, nil)
+	addr, store, audit, _ := startServer(t, func(cfg *config.Config) {
+		cfg.OIDC.AllowedClients = append(cfg.OIDC.AllowedClients, "poseidon-run")
+		cfg.OIDC.RequireDetailsClients = []string{"poseidon-run"}
+	})
 	if err := store.Update([]rbac.File{{Name: "row.yaml", Data: []byte(adminBinding)}}); err != nil {
 		t.Fatal(err)
 	}
@@ -590,6 +594,9 @@ func TestAuthorizationDetails(t *testing.T) {
 		{"table group made for audit", claims{details: details(detail("cloudsql-main/order", nil, "public.audit:select"))}, "SELECT count(*) FROM audit", true, true, "", "SET ROLE order_service; CREATE TABLE audit (id int)"},
 		{"a renamed table keeps its group away from the new one", claims{details: details(detail("cloudsql-main/order", nil, "public.audit:select"))}, "SELECT count(*) FROM audit_old", true, false, "",
 			"SET ROLE order_service; ALTER TABLE audit RENAME TO audit_old; CREATE TABLE audit (id int)"},
+		{"a required-details client without the claim is refused", claims{client: "poseidon-run", scope: write}, "", false, false, "", ""},
+		{"a required-details client with the claim connects", claims{client: "poseidon-run", details: details(detail("*", []string{"read"}))}, "SELECT 1", true, true, "", ""},
+		{"table intent ends at the token's exp", claims{ttl: 2 * time.Second, details: details(detail("cloudsql-main/order", nil, "public.items:select"))}, "SELECT pg_sleep(4)", true, false, "", ""},
 		{"missing table fails the connection", claims{scope: write, details: details(detail("cloudsql-main/order", nil, "public.nope:select"))}, "", false, false, "", ""},
 	}
 	for _, tt := range tests {
@@ -623,7 +630,7 @@ func TestAuthorizationDetails(t *testing.T) {
 			if (err == nil) != tt.wantStmt {
 				t.Fatalf("%q error = %v, want ok %v", tt.stmt, err, tt.wantStmt)
 			}
-			if err != nil && !strings.Contains(err.Error(), "permission denied") {
+			if err != nil && tt.claims.ttl == 0 && !strings.Contains(err.Error(), "permission denied") {
 				t.Fatalf("%q error = %v, want permission denied", tt.stmt, err)
 			}
 		})
@@ -1440,6 +1447,9 @@ func (is *issuer) token(c claims) string {
 		c.scope = "postgres:read"
 	}
 	exp := time.Now().Add(15 * time.Minute)
+	if c.ttl > 0 {
+		exp = time.Now().Add(c.ttl)
+	}
 	if c.expired {
 		exp = time.Now().Add(-time.Minute)
 	}
