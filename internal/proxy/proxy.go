@@ -115,6 +115,7 @@ const (
 
 // watch checks in until ctx ends: not ready until the first pass, then not ready only after
 // failuresToUnready failures in a row, retried a second apart; one pass makes it ready again.
+// Not ready is logged again whenever the failed step changes.
 func (s *Server) watch(ctx context.Context, in *instance) {
 	interval := time.Duration(s.cfg.SelfTestInterval)
 	fails, logged := 0, ""
@@ -133,13 +134,13 @@ func (s *Server) watch(ctx context.Context, in *instance) {
 				logged = "ready"
 				s.log.Info("instance ready", "instance", in.cfg.Name, "groups", s.selfTestGroups(in.cfg), "swept", in.swept, "pod", in.roles.Nonce())
 			}
-		case logged == "ready" && fails+1 < failuresToUnready:
+		case in.ready.Load() && fails+1 < failuresToUnready:
 			fails, next = fails+1, time.Second
 		default:
 			fails++
 			in.ready.Store(false)
-			if logged != "not ready" {
-				logged = "not ready"
+			if logged != "not ready: "+step {
+				logged = "not ready: " + step
 				s.log.Warn("instance not ready", "instance", in.cfg.Name, "step", step, "error", err, "failures", fails)
 			}
 			next, wait = min(wait, interval), min(2*wait, maxRetryWait)

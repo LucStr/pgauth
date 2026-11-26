@@ -489,7 +489,9 @@ func (m *Manager) SelfTest(ctx context.Context, groups []string, login func(role
 	if err != nil {
 		err = &StepError{Step: "log in as temp role", Err: err}
 	}
-	if derr := m.remove(context.WithoutCancel(ctx), e.name); derr != nil && err == nil {
+	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	if derr := m.remove(dctx, e.name); derr != nil && err == nil {
 		err = &StepError{Step: "drop temp role", Err: derr}
 	}
 	return err
