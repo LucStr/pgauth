@@ -13,6 +13,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -115,10 +116,11 @@ const (
 
 // watch checks in until ctx ends: not ready until the first pass, then not ready only after
 // failuresToUnready failures in a row, retried a second apart; one pass makes it ready again.
-// Not ready is logged again whenever the failed step changes.
+// Not ready is logged again whenever the failed step or its error changes.
 func (s *Server) watch(ctx context.Context, in *instance) {
 	interval := time.Duration(s.cfg.SelfTestInterval)
 	fails, logged := 0, ""
+	roleName := regexp.MustCompile(regexp.QuoteMeta(s.cfg.RolePrefix+"_selftest_") + `[a-z2-7]+`)
 	for wait := time.Second; ; {
 		step, err := in.check(ctx)
 		if ctx.Err() != nil {
@@ -139,8 +141,8 @@ func (s *Server) watch(ctx context.Context, in *instance) {
 		default:
 			fails++
 			in.ready.Store(false)
-			if logged != "not ready: "+step {
-				logged = "not ready: " + step
+			if key := "not ready: " + step + ": " + roleName.ReplaceAllString(err.Error(), ""); logged != key {
+				logged = key
 				s.log.Warn("instance not ready", "instance", in.cfg.Name, "step", step, "error", err, "failures", fails)
 			}
 			next, wait = min(wait, interval), min(2*wait, maxRetryWait)

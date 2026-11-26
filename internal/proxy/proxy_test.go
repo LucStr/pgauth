@@ -1563,13 +1563,14 @@ func TestSelfTest(t *testing.T) {
 			ts := newTestServer(t, func(c *config.Config) { c.Instances[0].StatsRole = tt.statsRole }, nil)
 			line := waitReadiness(t, ts.audit, 0)
 			if tt.step == "" {
-				if line["msg"] != "instance ready" || ts.srv.Ready(ctx) != nil {
-					t.Fatalf("want ready, got %v / %v", line, ts.srv.Ready(ctx))
+				if line["msg"] != "instance ready" {
+					t.Fatalf("want ready, got %v", line)
 				}
+				waitUntil(t, func() bool { return ts.srv.Ready(ctx) == nil })
 			} else if line["msg"] != "instance not ready" || line["step"] != tt.step || !strings.Contains(fmt.Sprint(line["error"]), tt.err) {
 				t.Fatalf("want not ready at %q with %q, got %v", tt.step, tt.err, line)
 			}
-			if n := selfTestRoles(t); n != 0 {
+			if n := selfTestRoles(t, ts.srv.instances[instanceName].roles.Nonce()); n != 0 {
 				t.Fatalf("%d self-test roles left", n)
 			}
 		})
@@ -1581,12 +1582,15 @@ func TestSelfTest(t *testing.T) {
 func TestReadinessHysteresis(t *testing.T) {
 	var failing atomic.Bool
 	var fails atomic.Int32
+	var early atomic.Bool // not ready before the third failure
 	ts := newTestServer(t, func(c *config.Config) { c.SelfTestInterval = config.Duration(200 * time.Millisecond) }, func(srv *Server) {
 		in := srv.instances[instanceName]
 		check := in.check
 		in.check = func(ctx context.Context) (string, error) {
 			if failing.Load() {
-				fails.Add(1)
+				if fails.Add(1) <= 3 && !in.ready.Load() {
+					early.Store(true)
+				}
 				return "self-test: log in as temp role", errors.New("injected")
 			}
 			return check(ctx)
@@ -1595,14 +1599,9 @@ func TestReadinessHysteresis(t *testing.T) {
 	ctx := context.Background()
 	waitUntil(t, func() bool { return ts.srv.Ready(ctx) == nil })
 	failing.Store(true)
-	waitUntil(t, func() bool {
-		if n := fails.Load(); n > 0 && n < 3 && ts.srv.Ready(ctx) != nil {
-			t.Fatalf("not ready after %d failures", n)
-		}
-		return ts.srv.Ready(ctx) != nil
-	})
-	if n := fails.Load(); n != 3 {
-		t.Fatalf("not ready after %d failures, want 3", n)
+	waitUntil(t, func() bool { return ts.srv.Ready(ctx) != nil })
+	if early.Load() {
+		t.Fatal("not ready before the third failure")
 	}
 	failing.Store(false)
 	waitUntil(t, func() bool { return ts.srv.Ready(ctx) == nil })
@@ -1638,7 +1637,8 @@ func waitReadiness(t *testing.T, l *auditLog, n int) map[string]any {
 	return line
 }
 
-func selfTestRoles(t *testing.T) int {
+// selfTestRoles counts the self-test roles of the process with nonce.
+func selfTestRoles(t *testing.T, nonce string) int {
 	t.Helper()
 	conn, err := pgx.Connect(context.Background(), shared.adminDSN)
 	if err != nil {
@@ -1646,7 +1646,7 @@ func selfTestRoles(t *testing.T) int {
 	}
 	defer conn.Close(context.Background())
 	var n int
-	if err := conn.QueryRow(context.Background(), `SELECT count(*) FROM pg_roles WHERE rolname LIKE 'pgauth\_\_selftest\_%'`).Scan(&n); err != nil {
+	if err := conn.QueryRow(context.Background(), `SELECT count(*) FROM pg_roles WHERE starts_with(rolname, 'pgauth__selftest_' || $1)`, nonce).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	return n

@@ -4,7 +4,7 @@
 
 - **Readiness proves the temporary-role path.** An instance is ready only after a self-test: create a temporary role the way real ones are made, in every group the instance can hand out (`<db>_read` and `<db>_write` of every served database, plus `statsRole`), log in as it to every served database, drop it. It runs at startup and every `selfTestInterval` (10m). Once ready, an instance turns not ready only after 3 failed checks in a row and is ready again after one pass, logging each change once with the failed step and Postgres's error. Metrics `pgauth.selftest.ok`, `pgauth.selftest.time` and `pgauth.selftest.runs`. Before, readiness was the issuer login plus the startup sweep, so a failing `CREATE ROLE` stayed green.
 
-Upgrading: the issuer needs `ADMIN` on both groups of every served database, and every group needs `CONNECT` (directly or through `PUBLIC`) on its database, or the instance never becomes ready and the log names the step.
+Upgrading: the issuer needs `ADMIN` on both groups of every served database and on `statsRole`, and every group needs `CONNECT` (directly or through `PUBLIC`) on its database, or the instance never becomes ready and the log names the step. v0.7.1 rejects the new `selfTestInterval` key, so leave it unset until no v0.7.1 pod reads the config.
 
 ## v0.7.1
 
