@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -205,10 +206,51 @@ spec:
   subjects: [{kind: User, name: mari@example.com}]
 `
 
-// startServer runs a pgauth with adminBinding against the shared Postgres; the returned store
-// swaps the access rules.
-// startServer also serves the HTTPS API (discovery, access) and returns its base URL.
+// startServer runs a pgauth with adminBinding against the shared Postgres once it is ready, and serves
+// the HTTPS API; the returned store swaps the access rules.
 func startServer(t *testing.T, mutate func(*config.Config)) (string, *rbac.Store, *auditLog, *httptest.Server) {
+	t.Helper()
+	ts := newTestServer(t, mutate, nil)
+	deadline := time.Now().Add(10 * time.Second)
+	for ts.srv.Ready(ts.ctx) != nil {
+		if time.Now().After(deadline) {
+			t.Fatalf("not ready: %v", ts.srv.Ready(ts.ctx))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = ts.srv.Serve(ts.ctx, ln)
+	}()
+	t.Cleanup(func() {
+		ts.cancel()
+		<-done
+	})
+	apiSrv := httptest.NewUnstartedServer(api.New(ts.cfg, ts.verifier, ts.store, ts.srv.Tables).Handler())
+	apiSrv.TLS = &tls.Config{Certificates: []tls.Certificate{ts.cert}}
+	apiSrv.StartTLS()
+	t.Cleanup(apiSrv.Close)
+	return ln.Addr().String(), ts.store, ts.audit, apiSrv
+}
+
+type testServer struct {
+	ctx      context.Context
+	cancel   context.CancelFunc
+	cfg      *config.Config
+	srv      *Server
+	store    *rbac.Store
+	audit    *auditLog
+	verifier *token.Verifier
+	cert     tls.Certificate
+}
+
+// newTestServer builds and starts a pgauth with adminBinding; before runs between New and Start.
+func newTestServer(t *testing.T, mutate func(*config.Config), before func(*Server)) *testServer {
 	t.Helper()
 	cfg := &config.Config{
 		TLS: config.TLS{CertFile: shared.certFile, KeyFile: shared.keyFile},
@@ -231,6 +273,7 @@ func startServer(t *testing.T, mutate func(*config.Config)) (string, *rbac.Store
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 	audit := &auditLog{}
 	log := telemetry.Logger(audit, sdklog.NewLoggerProvider(sdklog.WithProcessor(sdklog.NewSimpleProcessor(audit))))
 	verifier := token.NewVerifier(cfg.OIDC)
@@ -244,41 +287,21 @@ func startServer(t *testing.T, mutate func(*config.Config)) (string, *rbac.Store
 		t.Fatal(err)
 	}
 	srv := New(cfg, verifier, store, &tls.Config{Certificates: []tls.Certificate{cert}}, log)
+	if before != nil {
+		before(srv)
+	}
 	srv.Start(ctx)
-	deadline := time.Now().Add(10 * time.Second)
-	for srv.Ready(ctx) != nil {
-		if time.Now().After(deadline) {
-			t.Fatalf("not ready: %v", srv.Ready(ctx))
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		_ = srv.Serve(ctx, ln)
-	}()
-	t.Cleanup(func() {
-		cancel()
-		<-done
-	})
-	apiSrv := httptest.NewUnstartedServer(api.New(cfg, verifier, store, srv.Tables).Handler())
-	apiSrv.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
-	apiSrv.StartTLS()
-	t.Cleanup(apiSrv.Close)
-	return ln.Addr().String(), store, audit, apiSrv
+	return &testServer{ctx: ctx, cancel: cancel, cfg: cfg, srv: srv, store: store, audit: audit, verifier: verifier, cert: cert}
 }
 
 // auditLog keeps the server's JSON log lines so tests can read the connect record.
 // auditLog keeps the connect records twice: as stdout JSON lines and as OpenTelemetry log records,
 // the two outputs of telemetry.Logger.
 type auditLog struct {
-	mu    sync.Mutex
-	lines []map[string]any
-	otel  []map[string]any
+	mu        sync.Mutex
+	lines     []map[string]any
+	otel      []map[string]any
+	readiness []map[string]any
 }
 
 func (l *auditLog) Export(_ context.Context, records []sdklog.Record) error {
@@ -314,10 +337,16 @@ func (l *auditLog) ForceFlush(context.Context) error { return nil }
 
 func (l *auditLog) Write(p []byte) (int, error) {
 	var line map[string]any
-	if json.Unmarshal(p, &line) == nil && line["msg"] == "connect" {
-		l.mu.Lock()
+	if json.Unmarshal(p, &line) != nil {
+		return len(p), nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	switch line["msg"] {
+	case "connect":
 		l.lines = append(l.lines, line)
-		l.mu.Unlock()
+	case "instance ready", "instance not ready":
+		l.readiness = append(l.readiness, line)
 	}
 	return len(p), nil
 }
@@ -1494,4 +1523,131 @@ func writeCert(dir string) (certFile, keyFile string, err error) {
 		return "", "", err
 	}
 	return certFile, keyFile, os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}), 0o600)
+}
+
+// TestSelfTest: an instance is ready only while a temporary role in every group can log in to every
+// served database, and the not-ready log names the failed step.
+func TestSelfTest(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		statsRole  string
+		breakSQL   []string
+		restoreSQL []string
+		step, err  string // empty: ready
+	}{
+		{name: "every group and database works", statsRole: "pgauth_stats"},
+		{
+			name:       "issuer lost ADMIN on a write group",
+			breakSQL:   []string{`REVOKE ADMIN OPTION FOR assignment_write FROM pgauth`},
+			restoreSQL: []string{`GRANT assignment_write TO pgauth WITH ADMIN OPTION`},
+			step:       "self-test: create temp role in every group", err: "assignment_write",
+		},
+		{
+			name:       "groups lost CONNECT on a database",
+			breakSQL:   []string{`REVOKE CONNECT ON DATABASE assignment FROM assignment_read, assignment_write`},
+			restoreSQL: []string{`GRANT CONNECT ON DATABASE assignment TO assignment_read, assignment_write`},
+			step:       "self-test: log in as temp role", err: "database assignment",
+		},
+		{name: "stats role missing", statsRole: "pgauth_missing", step: "self-test: create temp role in every group", err: "does not exist"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			if err := execAll(ctx, shared.adminDSN, tt.breakSQL); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := execAll(ctx, shared.adminDSN, tt.restoreSQL); err != nil {
+					t.Error(err)
+				}
+			})
+			ts := newTestServer(t, func(c *config.Config) { c.Instances[0].StatsRole = tt.statsRole }, nil)
+			line := waitReadiness(t, ts.audit, 0)
+			if tt.step == "" {
+				if line["msg"] != "instance ready" {
+					t.Fatalf("want ready, got %v", line)
+				}
+				waitUntil(t, func() bool { return ts.srv.Ready(ctx) == nil })
+			} else if line["msg"] != "instance not ready" || line["step"] != tt.step || !strings.Contains(fmt.Sprint(line["error"]), tt.err) {
+				t.Fatalf("want not ready at %q with %q, got %v", tt.step, tt.err, line)
+			}
+			if n := selfTestRoles(t, ts.srv.instances[instanceName].roles.Nonce()); n != 0 {
+				t.Fatalf("%d self-test roles left", n)
+			}
+		})
+	}
+}
+
+// TestReadinessHysteresis: a ready instance turns not ready only after 3 failed checks in a row and
+// is ready again after one pass.
+func TestReadinessHysteresis(t *testing.T) {
+	var failing atomic.Bool
+	var fails atomic.Int32
+	var early atomic.Bool // not ready before the third failure
+	ts := newTestServer(t, func(c *config.Config) { c.SelfTestInterval = config.Duration(200 * time.Millisecond) }, func(srv *Server) {
+		in := srv.instances[instanceName]
+		check := in.check
+		in.check = func(ctx context.Context) (string, error) {
+			if failing.Load() {
+				if fails.Add(1) <= 3 && !in.ready.Load() {
+					early.Store(true)
+				}
+				return "self-test: log in as temp role", errors.New("injected")
+			}
+			return check(ctx)
+		}
+	})
+	ctx := context.Background()
+	waitUntil(t, func() bool { return ts.srv.Ready(ctx) == nil })
+	failing.Store(true)
+	waitUntil(t, func() bool { return ts.srv.Ready(ctx) != nil })
+	if early.Load() {
+		t.Fatal("not ready before the third failure")
+	}
+	failing.Store(false)
+	waitUntil(t, func() bool { return ts.srv.Ready(ctx) == nil })
+	if got := waitReadiness(t, ts.audit, 1); got["msg"] != "instance not ready" || got["failures"] != float64(3) || got["error"] != "injected" {
+		t.Fatalf("second readiness line = %v", got)
+	}
+	if got := waitReadiness(t, ts.audit, 2); got["msg"] != "instance ready" {
+		t.Fatalf("third readiness line = %v", got)
+	}
+}
+
+func waitUntil(t *testing.T, cond func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(15 * time.Second); !cond(); time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out")
+		}
+	}
+}
+
+// waitReadiness waits for the n-th "instance ready" / "instance not ready" log line.
+func waitReadiness(t *testing.T, l *auditLog, n int) map[string]any {
+	t.Helper()
+	var line map[string]any
+	waitUntil(t, func() bool {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		if len(l.readiness) > n {
+			line = l.readiness[n]
+		}
+		return line != nil
+	})
+	return line
+}
+
+// selfTestRoles counts the self-test roles of the process with nonce.
+func selfTestRoles(t *testing.T, nonce string) int {
+	t.Helper()
+	conn, err := pgx.Connect(context.Background(), shared.adminDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	var n int
+	if err := conn.QueryRow(context.Background(), `SELECT count(*) FROM pg_roles WHERE starts_with(rolname, 'pgauth__selftest_' || $1)`, nonce).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
 }

@@ -36,6 +36,8 @@ type Config struct {
 	// SweepMinAge is ignored since v0.6.0; roles belong to the process that made them.
 	SweepMinAge   Duration `json:"sweepMinAge"`
 	SweepInterval Duration `json:"sweepInterval"`
+	// SelfTestInterval is how often each instance proves a temporary role in every group can log in.
+	SelfTestInterval Duration `json:"selfTestInterval"`
 	// RoleConnectionLimit is each temporary role's CONNECTION LIMIT and how many connections share one.
 	RoleConnectionLimit int `json:"roleConnectionLimit"`
 	// MaxConnectionsPerUser caps one subject's open connections through this pgauth.
@@ -195,6 +197,9 @@ func (c *Config) ApplyDefaults() {
 	if c.SweepInterval == 0 {
 		c.SweepInterval = Duration(time.Minute)
 	}
+	if c.SelfTestInterval == 0 {
+		c.SelfTestInterval = Duration(10 * time.Minute)
+	}
 	if c.RoleConnectionLimit == 0 {
 		c.RoleConnectionLimit = 20
 	}
@@ -227,6 +232,9 @@ func (c *Config) Validate() error {
 	req(c.OIDC.Issuer, "oidc.issuer")
 	req(c.OIDC.Audience, "oidc.audience")
 	req(c.RBAC.Dir, "rbac.dir")
+	if c.SelfTestInterval < 0 {
+		errs = append(errs, errors.New("selfTestInterval must be positive"))
+	}
 	if len(c.Instances) == 0 {
 		errs = append(errs, errors.New("instances needs at least one entry"))
 	}

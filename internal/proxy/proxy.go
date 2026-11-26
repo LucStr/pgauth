@@ -13,6 +13,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,6 +26,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/LucStr/pgauth/internal/api"
@@ -54,6 +56,9 @@ type Server struct {
 
 	userMu    sync.Mutex
 	userConns map[string]int
+
+	selfTestRuns             metric.Int64Counter
+	selfTestOK, selfTestTime metric.Int64Gauge
 }
 
 type instance struct {
@@ -61,6 +66,8 @@ type instance struct {
 	ready atomic.Bool
 	pool  *pgxpool.Pool
 	roles *roles.Manager
+	swept int
+	check func(context.Context) (step string, err error)
 }
 
 type cancelTarget struct {
@@ -80,51 +87,149 @@ func New(cfg *config.Config, verifier *token.Verifier, store *rbac.Store, tlsCon
 		stopping:  make(chan struct{}),
 		userConns: map[string]int{},
 	}
-	for _, in := range cfg.Instances {
-		s.instances[in.Name] = &instance{cfg: in}
+	meter := otel.Meter("github.com/LucStr/pgauth")
+	s.selfTestRuns, _ = meter.Int64Counter("pgauth.selftest.runs", metric.WithDescription("Temporary-role self-tests by result, pass or fail"))
+	s.selfTestOK, _ = meter.Int64Gauge("pgauth.selftest.ok", metric.WithDescription("1 when the last temporary-role self-test passed, else 0"))
+	s.selfTestTime, _ = meter.Int64Gauge("pgauth.selftest.time", metric.WithDescription("When the last temporary-role self-test finished"), metric.WithUnit("s"))
+	for _, c := range cfg.Instances {
+		in := &instance{cfg: c}
+		in.check = func(ctx context.Context) (string, error) { return s.check(ctx, in) }
+		s.instances[c.Name] = in
 	}
 	return s
 }
 
-// Start connects to every instance as the issuer and sweeps leftover temporary roles, retrying
-// until each succeeds; connections to an instance are refused until then.
+// Start makes each instance ready once the issuer login, its owner lock, a sweep and a self-test
+// pass; the self-test then repeats every selfTestInterval and gates readiness.
 func (s *Server) Start(ctx context.Context) {
 	for _, in := range s.instances {
-		go func() {
-			for wait := time.Second; ; wait = min(2*wait, 30*time.Second) {
-				err := s.startInstance(ctx, in)
-				if err == nil {
-					return
-				}
-				s.log.Warn("instance not ready", "instance", in.cfg.Name, "error", err)
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(wait):
-				}
-			}
-		}()
+		go s.watch(ctx, in)
 	}
 }
 
-func (s *Server) startInstance(ctx context.Context, in *instance) error {
+const (
+	// failuresToUnready consecutive failed checks make a ready instance not ready.
+	failuresToUnready = 3
+	maxRetryWait      = 5 * time.Second
+	selfTestTimeout   = time.Minute
+)
+
+// watch checks in until ctx ends: not ready until the first pass, then not ready only after
+// failuresToUnready failures in a row, retried a second apart; one pass makes it ready again.
+// Not ready is logged again whenever the failed step or its error changes.
+func (s *Server) watch(ctx context.Context, in *instance) {
+	interval := time.Duration(s.cfg.SelfTestInterval)
+	fails, logged := 0, ""
+	roleName := regexp.MustCompile(regexp.QuoteMeta(s.cfg.RolePrefix+"_selftest_") + `[a-z2-7]+`)
+	for wait := time.Second; ; {
+		step, err := in.check(ctx)
+		if ctx.Err() != nil {
+			return
+		}
+		s.recordSelfTest(ctx, in.cfg.Name, err)
+		next := interval
+		switch {
+		case err == nil:
+			fails, wait = 0, time.Second
+			in.ready.Store(true)
+			if logged != "ready" {
+				logged = "ready"
+				s.log.Info("instance ready", "instance", in.cfg.Name, "groups", s.selfTestGroups(in.cfg), "swept", in.swept, "pod", in.roles.Nonce())
+			}
+		case in.ready.Load() && fails+1 < failuresToUnready:
+			fails, next = fails+1, time.Second
+		default:
+			fails++
+			in.ready.Store(false)
+			if key := "not ready: " + step + ": " + roleName.ReplaceAllString(err.Error(), ""); logged != key {
+				logged = key
+				s.log.Warn("instance not ready", "instance", in.cfg.Name, "step", step, "error", err, "failures", fails)
+			}
+			next, wait = min(wait, interval), min(2*wait, maxRetryWait)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(next):
+		}
+	}
+}
+
+// check starts the instance on first use, then proves a temporary role in every group can log in to
+// every served database; it returns the failed step.
+func (s *Server) check(ctx context.Context, in *instance) (string, error) {
+	if in.roles == nil {
+		if step, err := s.startInstance(ctx, in); err != nil {
+			return step, err
+		}
+	}
+	ctx, cancel := context.WithTimeout(ctx, selfTestTimeout)
+	defer cancel()
+	if err := in.pool.Ping(ctx); err != nil {
+		return "issuer login", err
+	}
+	err := in.roles.SelfTest(ctx, s.selfTestGroups(in.cfg), func(role, password string) error {
+		for _, db := range in.cfg.Databases {
+			cfg, err := pgconn.ParseConfig(in.cfg.ConnString(role, password, db))
+			if err != nil {
+				return err
+			}
+			guard(cfg, in.cfg)
+			pc, err := pgconn.ConnectConfig(ctx, cfg)
+			if err != nil {
+				return fmt.Errorf("database %s: %w", db, err)
+			}
+			_ = pc.Close(ctx)
+		}
+		return nil
+	})
+	if se := (*roles.StepError)(nil); errors.As(err, &se) {
+		return "self-test: " + se.Step, se.Err
+	}
+	return "self-test", err
+}
+
+// selfTestGroups are every group a temporary role on in can join, table groups aside.
+func (s *Server) selfTestGroups(in config.Instance) []string {
+	var groups []string
+	for _, db := range in.Databases {
+		groups = append(groups, s.cfg.GroupRole("read", db), s.cfg.GroupRole("write", db))
+	}
+	if in.StatsRole != "" {
+		groups = append(groups, in.StatsRole)
+	}
+	return groups
+}
+
+func (s *Server) recordSelfTest(ctx context.Context, instance string, err error) {
+	ok, result := int64(0), "fail"
+	if err == nil {
+		ok, result = 1, "pass"
+	}
+	at := metric.WithAttributes(attribute.String("pgauth.instance", instance))
+	s.selfTestRuns.Add(ctx, 1, at, metric.WithAttributes(attribute.String("result", result)))
+	s.selfTestOK.Record(ctx, ok, at)
+	s.selfTestTime.Record(ctx, time.Now().Unix(), at)
+}
+
+func (s *Server) startInstance(ctx context.Context, in *instance) (string, error) {
 	creds, err := in.cfg.Credentials()
 	if err != nil {
-		return err
+		return "issuer credentials", err
 	}
 	poolCfg, err := pgxpool.ParseConfig(in.cfg.ConnString(creds.Username, creds.Password, in.cfg.AdminDatabase))
 	if err != nil {
-		return err
+		return "issuer credentials", err
 	}
 	guard(&poolCfg.ConnConfig.Config, in.cfg)
 	poolCfg.MaxConns = 8
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
-		return err
+		return "issuer login", err
 	}
 	if err := pool.Ping(ctx); err != nil {
 		pool.Close()
-		return err
+		return "issuer login", err
 	}
 	mgr := roles.NewManager(pool, roles.Options{
 		TempGroup: s.cfg.TempGroup, Prefix: s.cfg.RolePrefix, ConnectionLimit: s.cfg.RoleConnectionLimit,
@@ -132,22 +237,21 @@ func (s *Server) startInstance(ctx context.Context, in *instance) error {
 	})
 	if err := mgr.Start(ctx); err != nil {
 		pool.Close()
-		return fmt.Errorf("owner lock: %w", err)
+		return "owner lock", err
 	}
 	removed, err := mgr.Sweep(ctx)
 	if err != nil {
+		mgr.Stop()
 		pool.Close()
-		return fmt.Errorf("sweep: %w", err)
+		return "sweep", err
 	}
 	go mgr.Run(ctx, time.Duration(s.cfg.SweepInterval))
-	s.log.Info("instance ready", "instance", in.cfg.Name, "swept", removed, "pod", mgr.Nonce())
-	in.pool, in.roles = pool, mgr
-	in.ready.Store(true)
-	return nil
+	in.pool, in.roles, in.swept = pool, mgr, removed
+	return "", nil
 }
 
 // Ready reports whether the issuer's keys and a valid set of access rules are loaded and every
-// instance accepts the issuer login.
+// instance passed its last self-test and accepts the issuer login.
 func (s *Server) Ready(ctx context.Context) error {
 	if !s.verifier.Ready() {
 		return errors.New("oidc keys not loaded")

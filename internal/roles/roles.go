@@ -151,6 +151,9 @@ func (m *Manager) Start(ctx context.Context) error {
 	return errors.New("could not take an owner lock")
 }
 
+// Stop releases the owner lock taken by Start; only before Run, which owns it after.
+func (m *Manager) Stop() { m.ownerConn.Release() }
+
 // Nonce identifies this process in the names and comments of its roles.
 func (m *Manager) Nonce() string { return m.nonce }
 
@@ -455,6 +458,43 @@ func hmacSum(key []byte, msg string) []byte {
 	mac := hmac.New(sha256.New, key)
 	mac.Write([]byte(msg))
 	return mac.Sum(nil)
+}
+
+// StepError is the failed step of a self-test.
+type StepError struct {
+	Step string
+	Err  error
+}
+
+func (e *StepError) Error() string { return e.Step + ": " + e.Err.Error() }
+func (e *StepError) Unwrap() error { return e.Err }
+
+// SelfTest creates a temporary role in groups the way Acquire does, calls login with it and drops it.
+// The role is never handed out; one left by a crash is swept as its owner's.
+func (m *Manager) SelfTest(ctx context.Context, groups []string, login func(role, password string) error) error {
+	e := &entry{name: m.opts.Prefix + "_selftest_" + m.nonce + randomName(6), created: time.Now(), password: randomName(32)}
+	m.mu.Lock()
+	m.byName[e.name] = e
+	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		delete(m.byName, e.name)
+		m.mu.Unlock()
+	}()
+	spec := Spec{Subject: "self-test", ClientID: "pgauth self-test", Groups: groups}
+	if err := m.create(ctx, e, spec, time.Now().Add(validFor)); err != nil {
+		return &StepError{Step: "create temp role in every group", Err: err}
+	}
+	err := login(e.name, e.password)
+	if err != nil {
+		err = &StepError{Step: "log in as temp role", Err: err}
+	}
+	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	if derr := m.remove(dctx, e.name); derr != nil && err == nil {
+		err = &StepError{Step: "drop temp role", Err: derr}
+	}
+	return err
 }
 
 func literal(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }
