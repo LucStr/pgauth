@@ -48,6 +48,10 @@ _Avoid_: pg-gate, proxy, gateway
 A Postgres login pgauth creates for one holder and set of rights, and drops when the holder's last connection closes.
 _Avoid_: temp user, ephemeral user, dynamic credential
 
+**Self-test**:
+The check that gates an instance's readiness: pgauth creates a temporary role joined to every group role, logs in as it to every served database and drops it, at startup and every `selfTestInterval`.
+_Avoid_: health check, probe, smoke test
+
 **Group role**:
 A Postgres role, one per database and level, that carries the actual table privileges a temporary role joins.
 _Avoid_: db role, permission role

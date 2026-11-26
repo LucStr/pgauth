@@ -232,8 +232,20 @@ values; `require` encrypts without verifying the server certificate, `verify-ca`
 `ghcr.io/lucstr/pgauth:vX.Y.Z` runs as non-root and needs no writable filesystem.
 
 - **Health:** `GET /healthz` answers while the process runs; `GET /readyz` answers 200 once the
-  issuer's keys and a valid set of access rules are loaded and every instance accepts the issuer login
-  (and its startup sweep ran); its body reports a rejected rules change.
+  issuer's keys and a valid set of access rules are loaded and every instance passed its self-test;
+  its body reports a rejected rules change.
+- **Self-test** ([ADR 0014](docs/adr/0014-ready-only-after-a-self-test.md)): at startup (after the owner lock and first sweep) and every `selfTestInterval` (10m),
+  pgauth creates `<rolePrefix>_selftest_<pod><random>` with the same statement real temporary roles
+  get, in every group the instance can hand out (`<db>_read` and `<db>_write` of every served database,
+  plus `statsRole`), logs in as it to every served database and drops it. Until it passes, the
+  instance refuses connections. Once ready, it turns not ready only after 3 failed checks in a row
+  (retried 1 s apart) and is ready again after one pass; open connections are never touched. Each
+  change logs once: `instance ready`, or `instance not ready` with `failures`, the failed `step`
+  (`issuer credentials`, `issuer login`, `owner lock`, `sweep`, `self-test: create temp role in every
+  group`, `self-test: log in as temp role`, `self-test: drop temp role`) and Postgres's `error`.
+  Metrics per `pgauth.instance`: `pgauth.selftest.ok` (1/0), `pgauth.selftest.time` (Unix seconds)
+  and `pgauth.selftest.runs` by `result` (`pass`, `fail`). A self-test role left by a crash is swept
+  like any dead owner's role.
 - **HTTPS API** (`http.listen`, same certificate as Postgres; [ADR 0011](docs/adr/0011-serve-publishes-discovery-and-access.md)):
   - `GET /.well-known/pgauth` → `{postgres, issuer, audience, cli_client_id, scopes: {read, write},
     instances: [{name, databases}]}`, public, so a connector can set itself up from a host name.
